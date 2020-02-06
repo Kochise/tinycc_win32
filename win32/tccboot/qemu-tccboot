@@ -1,0 +1,6 @@
+#!/bin/sh 
+~/qemu-current/i386-softmmu/qemu -snapshot -user-net -serial stdio \
+-kernel tccboot \
+-initrd initrd.img \
+-append "root=/dev/hda" \
+-hda example.romfs

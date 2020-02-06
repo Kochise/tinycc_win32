@@ -1,0 +1,17 @@
+# This file contains the TinyCC command line arguments needed to
+# compile the hello.c program.
+
+# the output binary (DO NOT CHANGE IT)
+-o kernel 
+# no default libraries
+-nostdlib 
+# no default includes paths
+-nostdinc 
+# statically linked output
+-static 
+# address of the start of the .text section
+-Wl,-Ttext,000100000 
+# force binary output format
+-Wl,--oformat,binary
+# sources files
+hello.c

@@ -1,0 +1,64 @@
+Introduction:
+------------
+
+WARNING: don't try to play with TCCBOOT unless you are a kernel
+hacker!
+
+TCCBOOT is a bootloader which uses TinyCC to compile C and assembly
+sources and boot the resulting executable. It is typically used to
+compile the Linux kernel sources at boot time.
+
+TCCBOOT boots the same way as a Linux kernel, so any boot loader which
+can run a 'bzImage' Linux kernel image can run TCCBOOT. I only tested
+it with ISOLINUX, but LILO or GRUB should work too.
+
+TCCBOOT reads C or assembly sources from a gzipped ROMFS filesystem
+stored in an Initial Ram Disk (initrd). It first reads the file
+'boot/tccargs' which contains the TinyCC command line (same syntax as
+the tcc executable). The TinyCC invocation should output one binary
+image 'kernel'. This image is loaded at address 0x00100000. TCCBOOT
+then does a jump to the address 0x00100000 in 32 bit flat mode. This
+is compatible with the ABI of the 'vmlinux' kernel image.
+
+Compilation:
+-----------
+
+TCCBOOT was only tested with Linux 2.4.26. In order to build TCCBOOT,
+you must first compile a 2.4.26 kernel because for simplicity TCCBOOT
+uses some binary files and headers from the Linux kernel. TCCBOOT also
+needs the source code of TinyCC (tested with TinyCC version
+0.9.21). You can modify the Makefile to give the needed paths.
+
+Example:
+-------
+
+An "Hello World" ROMFS partition is included (initrd.img). You can
+rebuild it from the example/ directory. You can test it with the QEMU
+PC emulator with the 'qemu-tccboot' script.
+
+Kernel compilation:
+------------------
+
+For your information, the patch 'linux-2.4.26-tcc.patch' gives the
+necessary modifications to build a Linux kernel with TinyCC. The
+corresponding kernel configuration is in file
+linux-2.4.26-config. Patches are necessary for the following reasons:
+
+- unsupported assembly directives: .rept, .endr, .subsection
+- '#define __ASSEMBLY__' needed in assembly sources
+- static variables cannot be seen from the inline assembly code
+- typing/lvalue problems with '? :'
+- no long long bit fields
+- 'aligned' attribute not supported for whole structs, only for fields
+- obscur preprocessor bug
+
+Some of these problems could easily be fixed, but I am too lazy
+now. It is sure that there are still many bugs in the kernel generated
+by TinyCC/TCCBOOT, but at least it can boot and launch a shell.
+
+License:
+-------
+
+TCCBOOT is distributed under the GNU General Public License.
+
+Fabrice Bellard.

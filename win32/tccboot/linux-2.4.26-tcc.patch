@@ -1,0 +1,427 @@
+diff -ruNw /tmp/linux-2.4.26/arch/i386/kernel/entry.S linux-2.4.26/arch/i386/kernel/entry.S
+--- /tmp/linux-2.4.26/arch/i386/kernel/entry.S	2003-06-13 16:51:29.000000000 +0200
++++ linux-2.4.26/arch/i386/kernel/entry.S	2004-10-23 22:19:02.000000000 +0200
+@@ -1,3 +1,4 @@
++#define __ASSEMBLY__
+ /*
+  *  linux/arch/i386/entry.S
+  *
+@@ -664,6 +665,21 @@
+  	.long SYMBOL_NAME(sys_ni_syscall)	/* sys_remap_file_pages */
+  	.long SYMBOL_NAME(sys_ni_syscall)	/* sys_set_tid_address */
+ 
++#if 0
+ 	.rept NR_syscalls-(.-sys_call_table)/4
+ 		.long SYMBOL_NAME(sys_ni_syscall)
+ 	.endr
++#else
++        .long SYMBOL_NAME(sys_ni_syscall)
++        .long SYMBOL_NAME(sys_ni_syscall)
++        .long SYMBOL_NAME(sys_ni_syscall)
++        .long SYMBOL_NAME(sys_ni_syscall)
++        .long SYMBOL_NAME(sys_ni_syscall)
++        .long SYMBOL_NAME(sys_ni_syscall)
++        .long SYMBOL_NAME(sys_ni_syscall)
++        .long SYMBOL_NAME(sys_ni_syscall)
++        .long SYMBOL_NAME(sys_ni_syscall)
++        .long SYMBOL_NAME(sys_ni_syscall)
++        .long SYMBOL_NAME(sys_ni_syscall)
++        .long SYMBOL_NAME(sys_ni_syscall)
++#endif          
+diff -ruNw /tmp/linux-2.4.26/arch/i386/kernel/head.S linux-2.4.26/arch/i386/kernel/head.S
+--- /tmp/linux-2.4.26/arch/i386/kernel/head.S	2003-11-28 19:26:19.000000000 +0100
++++ linux-2.4.26/arch/i386/kernel/head.S	2004-10-25 21:18:30.000000000 +0200
+@@ -1,3 +1,4 @@
++#define __ASSEMBLY__
+ /*
+  *  linux/arch/i386/kernel/head.S -- the 32-bit startup code.
+  *
+@@ -41,6 +42,8 @@
+  *
+  * On entry, %esi points to the real-mode code as a 32-bit pointer.
+  */
++.globl _start        
++_start: 
+ startup_32:
+ /*
+  * Set segments to known values
+diff -ruNw /tmp/linux-2.4.26/arch/i386/kernel/i387.c linux-2.4.26/arch/i386/kernel/i387.c
+--- /tmp/linux-2.4.26/arch/i386/kernel/i387.c	2003-08-25 13:44:39.000000000 +0200
++++ linux-2.4.26/arch/i386/kernel/i387.c	2004-10-14 04:17:43.000000000 +0200
+@@ -25,7 +25,7 @@
+ #define HAVE_HWFP 1
+ #endif
+ 
+-static union i387_union empty_fpu_state;
++union i387_union empty_fpu_state;
+ 
+ void __init boot_init_fpu(void)
+ {
+diff -ruNw /tmp/linux-2.4.26/arch/i386/kernel/process.c linux-2.4.26/arch/i386/kernel/process.c
+--- /tmp/linux-2.4.26/arch/i386/kernel/process.c	2004-02-18 14:36:30.000000000 +0100
++++ linux-2.4.26/arch/i386/kernel/process.c	2004-10-25 21:30:36.000000000 +0200
+@@ -52,7 +52,7 @@
+ 
+ #include <linux/irq.h>
+ 
+-asmlinkage void ret_from_fork(void) __asm__("ret_from_fork");
++asmlinkage void ret_from_fork(void) /* __asm__("ret_from_fork") */ ;
+ 
+ int hlt_counter;
+ 
+@@ -217,7 +217,7 @@
+ 	0x000092000100ffffULL	/* 16-bit real-mode 64k data at 0x00000100 */
+ };
+ 
+-static struct
++struct
+ {
+ 	unsigned short       size __attribute__ ((packed));
+ 	unsigned long long * base __attribute__ ((packed));
+diff -ruNw /tmp/linux-2.4.26/arch/i386/kernel/setup.c linux-2.4.26/arch/i386/kernel/setup.c
+--- /tmp/linux-2.4.26/arch/i386/kernel/setup.c	2004-04-14 15:05:25.000000000 +0200
++++ linux-2.4.26/arch/i386/kernel/setup.c	2004-10-17 19:38:37.000000000 +0200
+@@ -1392,7 +1392,7 @@
+  */
+  
+ extern void vide(void);
+-__asm__(".align 4\nvide: ret");
++__asm__(".align 4\n.globl vide\nvide: ret");
+ 
+ static int __init init_amd(struct cpuinfo_x86 *c)
+ {
+diff -ruNw /tmp/linux-2.4.26/arch/i386/mm/init.c linux-2.4.26/arch/i386/mm/init.c
+--- /tmp/linux-2.4.26/arch/i386/mm/init.c	2004-04-14 15:05:25.000000000 +0200
++++ linux-2.4.26/arch/i386/mm/init.c	2004-10-23 22:35:47.000000000 +0200
+@@ -36,6 +36,7 @@
+ #include <asm/fixmap.h>
+ #include <asm/e820.h>
+ #include <asm/apic.h>
++#include <asm-generic/tlb.h>
+ #include <asm/tlb.h>
+ 
+ mmu_gather_t mmu_gathers[NR_CPUS];
+diff -ruNw /tmp/linux-2.4.26/arch/i386/mm/pageattr.c linux-2.4.26/arch/i386/mm/pageattr.c
+--- /tmp/linux-2.4.26/arch/i386/mm/pageattr.c	2002-11-29 00:53:09.000000000 +0100
++++ linux-2.4.26/arch/i386/mm/pageattr.c	2004-10-14 00:43:58.000000000 +0200
+@@ -44,8 +44,12 @@
+ 	addr = address & LARGE_PAGE_MASK; 
+ 	pbase = (pte_t *)page_address(base);
+ 	for (i = 0; i < PTRS_PER_PTE; i++, addr += PAGE_SIZE) {
+-		pbase[i] = mk_pte_phys(addr, 
+-				      addr == address ? prot : PAGE_KERNEL);
++                pgprot_t prot1;
++                if (addr == address)
++                        prot1 = prot;
++                else
++                        prot1 = PAGE_KERNEL;
++		pbase[i] = mk_pte_phys(addr, prot1);
+ 	}
+ 	return base;
+ } 
+diff -ruNw /tmp/linux-2.4.26/drivers/ide/ide-lib.c linux-2.4.26/drivers/ide/ide-lib.c
+--- /tmp/linux-2.4.26/drivers/ide/ide-lib.c	2003-06-13 16:51:33.000000000 +0200
++++ linux-2.4.26/drivers/ide/ide-lib.c	2004-10-23 23:00:51.000000000 +0200
+@@ -171,7 +171,7 @@
+ 		BUG();
+ 	return min(speed, speed_max[mode]);
+ #else /* !CONFIG_BLK_DEV_IDEDMA */
+-	return min(speed, XFER_PIO_4);
++        return min((int)speed, XFER_PIO_4);
+ #endif /* CONFIG_BLK_DEV_IDEDMA */
+ }
+ 
+diff -ruNw /tmp/linux-2.4.26/fs/partitions/efi.h linux-2.4.26/fs/partitions/efi.h
+--- /tmp/linux-2.4.26/fs/partitions/efi.h	2003-08-25 13:44:43.000000000 +0200
++++ linux-2.4.26/fs/partitions/efi.h	2004-10-25 21:32:29.000000000 +0200
+@@ -85,9 +85,13 @@
+ } __attribute__ ((packed)) gpt_header;
+ 
+ typedef struct _gpt_entry_attributes {
++#if 0
+ 	u64 required_to_function:1;
+ 	u64 reserved:47;
+         u64 type_guid_specific:16;
++#else
++        u64 required;
++#endif
+ } __attribute__ ((packed)) gpt_entry_attributes;
+ 
+ typedef struct _gpt_entry {
+diff -ruNw /tmp/linux-2.4.26/include/asm-i386/bugs.h linux-2.4.26/include/asm-i386/bugs.h
+--- /tmp/linux-2.4.26/include/asm-i386/bugs.h	2002-08-03 02:39:45.000000000 +0200
++++ linux-2.4.26/include/asm-i386/bugs.h	2004-10-25 21:31:34.000000000 +0200
+@@ -50,8 +50,8 @@
+ 
+ __setup("no387", no_387);
+ 
+-static double __initdata x = 4195835.0;
+-static double __initdata y = 3145727.0;
++double __initdata x = 4195835.0;
++double __initdata y = 3145727.0;
+ 
+ /*
+  * This used to check for exceptions.. 
+diff -ruNw /tmp/linux-2.4.26/include/asm-i386/byteorder.h linux-2.4.26/include/asm-i386/byteorder.h
+--- /tmp/linux-2.4.26/include/asm-i386/byteorder.h	2003-06-13 16:51:38.000000000 +0200
++++ linux-2.4.26/include/asm-i386/byteorder.h	2004-10-23 23:08:08.000000000 +0200
+@@ -42,8 +42,10 @@
+ 		__u64 u;
+ 	} v;
+ 	v.u = val;
+-#ifdef CONFIG_X86_BSWAP
+-	asm("bswapl %0 ; bswapl %1 ; xchgl %0,%1" 
++#if defined(CONFIG_X86_BSWAP) && 0
++        /* XXX: constraint bug
++           bswap %eax ; bswap (%ecx) ; xchgl %eax,(%ecx) */
++	asm("bswap %0 ; bswap %1 ; xchgl %0,%1" 
+ 	    : "=r" (v.s.a), "=r" (v.s.b) 
+ 	    : "0" (v.s.a), "1" (v.s.b)); 
+ #else
+diff -ruNw /tmp/linux-2.4.26/include/asm-i386/hw_irq.h linux-2.4.26/include/asm-i386/hw_irq.h
+--- /tmp/linux-2.4.26/include/asm-i386/hw_irq.h	2003-08-25 13:44:43.000000000 +0200
++++ linux-2.4.26/include/asm-i386/hw_irq.h	2004-10-23 23:08:08.000000000 +0200
+@@ -156,6 +156,7 @@
+ asmlinkage void call_do_IRQ(void); \
+ __asm__( \
+ 	"\n" __ALIGN_STR"\n" \
++	".globl common_interrupt\n\t" \
+ 	"common_interrupt:\n\t" \
+ 	SAVE_ALL \
+ 	SYMBOL_NAME_STR(call_do_IRQ)":\n\t" \
+@@ -176,6 +177,7 @@
+ asmlinkage void IRQ_NAME(nr); \
+ __asm__( \
+ "\n"__ALIGN_STR"\n" \
++".globl " SYMBOL_NAME_STR(IRQ) #nr "_interrupt\n\t"\
+ SYMBOL_NAME_STR(IRQ) #nr "_interrupt:\n\t" \
+ 	"pushl $"#nr"-256\n\t" \
+ 	"jmp common_interrupt");
+diff -ruNw /tmp/linux-2.4.26/include/asm-i386/page.h linux-2.4.26/include/asm-i386/page.h
+--- /tmp/linux-2.4.26/include/asm-i386/page.h	2002-08-03 02:39:45.000000000 +0200
++++ linux-2.4.26/include/asm-i386/page.h	2004-10-23 23:08:08.000000000 +0200
+@@ -95,7 +95,7 @@
+  * undefined" opcode for parsing in the trap handler.
+  */
+ 
+-#if 1	/* Set to zero for a slightly smaller kernel */
++#if 0	/* Set to zero for a slightly smaller kernel */
+ #define BUG()				\
+  __asm__ __volatile__(	"ud2\n"		\
+ 			"\t.word %c0\n"	\
+diff -ruNw /tmp/linux-2.4.26/include/asm-i386/processor.h linux-2.4.26/include/asm-i386/processor.h
+--- /tmp/linux-2.4.26/include/asm-i386/processor.h	2004-02-18 14:36:32.000000000 +0100
++++ linux-2.4.26/include/asm-i386/processor.h	2004-10-23 23:08:08.000000000 +0200
+@@ -300,6 +300,7 @@
+ 	long	st_space[32];	/* 8*16 bytes for each FP-reg = 128 bytes */
+ 	long	xmm_space[32];	/* 8*16 bytes for each XMM-reg = 128 bytes */
+ 	long	padding[56];
++    int dummy[0] __attribute__ ((aligned (16)));
+ } __attribute__ ((aligned (16)));
+ 
+ struct i387_soft_struct {
+diff -ruNw /tmp/linux-2.4.26/include/asm-i386/semaphore.h linux-2.4.26/include/asm-i386/semaphore.h
+--- /tmp/linux-2.4.26/include/asm-i386/semaphore.h	2002-11-29 00:53:15.000000000 +0100
++++ linux-2.4.26/include/asm-i386/semaphore.h	2004-10-25 21:31:34.000000000 +0200
+@@ -207,7 +207,7 @@
+ 		"2:\tcall __up_wakeup\n\t"
+ 		"jmp 1b\n"
+ 		LOCK_SECTION_END
+-		".subsection 0\n"
++                /*		".subsection 0\n" */
+ 		:"=m" (sem->count)
+ 		:"c" (sem)
+ 		:"memory");
+diff -ruNw /tmp/linux-2.4.26/include/asm-i386/string.h linux-2.4.26/include/asm-i386/string.h
+--- /tmp/linux-2.4.26/include/asm-i386/string.h	2001-11-22 20:46:18.000000000 +0100
++++ linux-2.4.26/include/asm-i386/string.h	2004-10-23 23:08:08.000000000 +0200
+@@ -178,7 +178,7 @@
+ 	"leal -1(%%esi),%0\n"
+ 	"2:\ttestb %%al,%%al\n\t"
+ 	"jne 1b"
+-	:"=g" (__res), "=&S" (d0), "=&a" (d1) :"0" (0),"1" (s),"2" (c));
++	:"=r" (__res), "=&S" (d0), "=&a" (d1) :"0" (0),"1" (s),"2" (c));
+ return __res;
+ }
+ 
+diff -ruNw /tmp/linux-2.4.26/include/asm-i386/system.h linux-2.4.26/include/asm-i386/system.h
+--- /tmp/linux-2.4.26/include/asm-i386/system.h	2004-04-14 15:05:40.000000000 +0200
++++ linux-2.4.26/include/asm-i386/system.h	2004-10-25 21:30:22.000000000 +0200
+@@ -28,7 +28,7 @@
+ 		     "popl %%esi\n\t"					\
+ 		     :"=m" (prev->thread.esp),"=m" (prev->thread.eip),	\
+ 		      "=b" (last)					\
+-		     :"m" (next->thread.esp),"m" (next->thread.eip),	\
++		     :"g" (next->thread.esp),"g" (next->thread.eip),	\
+ 		      "a" (prev), "d" (next),				\
+ 		      "b" (prev));					\
+ } while (0)
+@@ -313,7 +313,7 @@
+ #define set_wmb(var, value) do { var = value; wmb(); } while (0)
+ 
+ /* interrupt control.. */
+-#define __save_flags(x)		__asm__ __volatile__("pushfl ; popl %0":"=g" (x): /* no input */)
++#define __save_flags(x)		__asm__ __volatile__("pushfl ; popl %0" : "=g" (x) /* no input */)
+ #define __restore_flags(x) 	__asm__ __volatile__("pushl %0 ; popfl": /* no output */ :"g" (x):"memory", "cc")
+ #define __cli() 		__asm__ __volatile__("cli": : :"memory")
+ #define __sti()			__asm__ __volatile__("sti": : :"memory")
+diff -ruNw /tmp/linux-2.4.26/include/linux/byteorder/generic.h linux-2.4.26/include/linux/byteorder/generic.h
+--- /tmp/linux-2.4.26/include/linux/byteorder/generic.h	2003-11-28 19:26:21.000000000 +0100
++++ linux-2.4.26/include/linux/byteorder/generic.h	2004-10-17 22:09:20.000000000 +0200
+@@ -86,8 +86,8 @@
+  */
+ #define cpu_to_le64 __cpu_to_le64
+ #define le64_to_cpu __le64_to_cpu
+-#define cpu_to_le32 __cpu_to_le32
+-#define le32_to_cpu __le32_to_cpu
++#define cpu_to_le32(x) __cpu_to_le32(x)
++#define le32_to_cpu(x) __le32_to_cpu(x)
+ #define cpu_to_le16 __cpu_to_le16
+ #define le16_to_cpu __le16_to_cpu
+ #define cpu_to_be64 __cpu_to_be64
+diff -ruNw /tmp/linux-2.4.26/include/linux/linkage.h linux-2.4.26/include/linux/linkage.h
+--- /tmp/linux-2.4.26/include/linux/linkage.h	2000-12-11 21:49:54.000000000 +0100
++++ linux-2.4.26/include/linux/linkage.h	2004-10-23 23:08:08.000000000 +0200
+@@ -19,11 +19,7 @@
+ 
+ #define SYMBOL_NAME_STR(X) #X
+ #define SYMBOL_NAME(X) X
+-#ifdef __STDC__
+-#define SYMBOL_NAME_LABEL(X) X##:
+-#else
+-#define SYMBOL_NAME_LABEL(X) X/**/:
+-#endif
++#define SYMBOL_NAME_LABEL(X) X:
+ 
+ #ifdef __arm__
+ #define __ALIGN .align 0
+diff -ruNw /tmp/linux-2.4.26/include/linux/spinlock.h linux-2.4.26/include/linux/spinlock.h
+--- /tmp/linux-2.4.26/include/linux/spinlock.h	2004-02-18 14:36:32.000000000 +0100
++++ linux-2.4.26/include/linux/spinlock.h	2004-10-25 21:31:34.000000000 +0200
+@@ -41,6 +41,7 @@
+ 
+ #include <linux/stringify.h>
+ 
++#if 0
+ #define LOCK_SECTION_NAME			\
+ 	".text.lock." __stringify(KBUILD_BASENAME)
+ 
+@@ -51,6 +52,11 @@
+ 	LOCK_SECTION_NAME ":\n\t"		\
+ 	".endif\n\t"
+ 
++#else
++#define LOCK_SECTION_NAME ".text.lock"
++#define LOCK_SECTION_START(extra)	".section " LOCK_SECTION_NAME "\n\t"
++#endif
++
+ #define LOCK_SECTION_END			\
+ 	".previous\n\t"
+ 
+diff -ruNw /tmp/linux-2.4.26/include/linux/wait.h linux-2.4.26/include/linux/wait.h
+--- /tmp/linux-2.4.26/include/linux/wait.h	2003-08-25 13:44:44.000000000 +0200
++++ linux-2.4.26/include/linux/wait.h	2004-10-25 21:31:34.000000000 +0200
+@@ -64,14 +64,14 @@
+ # define wq_lock_t spinlock_t
+ # define WAITQUEUE_RW_LOCK_UNLOCKED SPIN_LOCK_UNLOCKED
+ 
+-# define wq_read_lock spin_lock
+-# define wq_read_lock_irqsave spin_lock_irqsave
+-# define wq_read_unlock spin_unlock
+-# define wq_read_unlock_irqrestore spin_unlock_irqrestore
+-# define wq_write_lock_irq spin_lock_irq
+-# define wq_write_lock_irqsave spin_lock_irqsave
+-# define wq_write_unlock_irqrestore spin_unlock_irqrestore
+-# define wq_write_unlock spin_unlock
++# define wq_read_lock(lock) spin_lock(lock)
++# define wq_read_lock_irqsave(lock, flags) spin_lock_irqsave(lock, flags)
++# define wq_read_unlock(lock) spin_unlock(lock)
++# define wq_read_unlock_irqrestore(lock, flags) spin_unlock_irqrestore(lock, flags)
++# define wq_write_lock_irq(lock) spin_lock_irq(lock)
++# define wq_write_lock_irqsave(lock, flags) spin_lock_irqsave(lock, flags)
++# define wq_write_unlock_irqrestore(lock, flags) spin_unlock_irqrestore(lock, flags)
++# define wq_write_unlock(lock) spin_unlock(lock)
+ #endif
+ 
+ struct __wait_queue_head {
+diff -ruNw /tmp/linux-2.4.26/net/core/dev.c linux-2.4.26/net/core/dev.c
+--- /tmp/linux-2.4.26/net/core/dev.c	2004-04-14 15:05:41.000000000 +0200
++++ linux-2.4.26/net/core/dev.c	2004-10-14 03:27:45.000000000 +0200
+@@ -2013,8 +2013,17 @@
+ 	ret = 0;
+ 	if ((old_flags^flags)&IFF_UP)	/* Bit is different  ? */
+ 	{
+-		ret = ((old_flags & IFF_UP) ? dev_close : dev_open)(dev);
++            int (*dev_func)(struct net_device *);
+ 
++#if 0
++		ret = ((old_flags & IFF_UP) ? dev_close : dev_open)(dev);
++#else
++            if (old_flags & IFF_UP)
++                dev_func = dev_close;
++            else
++                dev_func = dev_open;
++            ret = dev_func(dev);
++#endif
+ 		if (ret == 0) 
+ 			dev_mc_upload(dev);
+ 	}
+diff -ruNw /tmp/linux-2.4.26/net/ipv4/raw.c linux-2.4.26/net/ipv4/raw.c
+--- /tmp/linux-2.4.26/net/ipv4/raw.c	2003-08-25 13:44:44.000000000 +0200
++++ linux-2.4.26/net/ipv4/raw.c	2004-10-23 22:53:26.000000000 +0200
+@@ -311,6 +311,10 @@
+ 	u32 daddr;
+ 	u8  tos;
+ 	int err;
++        int (*getfrag)(const void *,
++                       char *,
++                       unsigned int,	
++                       unsigned int);
+ 
+ 	/* This check is ONLY to check for arithmetic overflow
+ 	   on integer(!) len. Not more! Real check will be made
+@@ -426,8 +430,11 @@
+ 	rfh.dst		= &rt->u.dst;
+ 	if (!ipc.addr)
+ 		ipc.addr = rt->rt_dst;
+-	err = ip_build_xmit(sk, sk->protinfo.af_inet.hdrincl ? raw_getrawfrag :
+-		       	    raw_getfrag, &rfh, len, &ipc, rt, msg->msg_flags);
++        if (sk->protinfo.af_inet.hdrincl)
++            getfrag =raw_getrawfrag;
++        else
++            getfrag = raw_getfrag;
++	err = ip_build_xmit(sk, getfrag, &rfh, len, &ipc, rt, msg->msg_flags);
+ 
+ done:
+ 	if (free)
+diff -ruNw /tmp/linux-2.4.26/net/ipv4/udp.c linux-2.4.26/net/ipv4/udp.c
+--- /tmp/linux-2.4.26/net/ipv4/udp.c	2004-04-14 15:05:41.000000000 +0200
++++ linux-2.4.26/net/ipv4/udp.c	2004-10-23 22:54:30.000000000 +0200
+@@ -441,6 +441,10 @@
+ 	u32 daddr;
+ 	u8  tos;
+ 	int err;
++        int (*getfrag)(const void *,
++                       char *,
++                       unsigned int,	
++                       unsigned int);
+ 
+ 	/* This check is ONLY to check for arithmetic overflow
+ 	   on integer(!) len. Not more! Real check will be made
+@@ -560,11 +564,12 @@
+ 	/* RFC1122: OK.  Provides the checksumming facility (MUST) as per */
+ 	/* 4.1.3.4. It's configurable by the application via setsockopt() */
+ 	/* (MAY) and it defaults to on (MUST). */
+-
++        if (sk->no_check == UDP_CSUM_NOXMIT)
++            getfrag = udp_getfrag_nosum;
++        else
++            getfrag = udp_getfrag;
+ 	err = ip_build_xmit(sk,
+-			    (sk->no_check == UDP_CSUM_NOXMIT ?
+-			     udp_getfrag_nosum :
+-			     udp_getfrag),
++			    getfrag,
+ 			    &ufh, ulen, &ipc, rt, msg->msg_flags);
+ 
+ out:
