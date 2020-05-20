@@ -242,17 +242,22 @@ ST_FUNC void gsym_addr(int t_, int a_)
 
 static int arm64_type_size(int t)
 {
+    /*
+     * case values are in increasing order (from 1 to 11).
+     * which 'may' help compiler optimizers. See tcc.h
+     */
     switch (t & VT_BTYPE) {
-    case VT_INT: return 2;
     case VT_BYTE: return 0;
     case VT_SHORT: return 1;
+    case VT_INT: return 2;
+    case VT_LLONG: return 3;
     case VT_PTR: return 3;
     case VT_FUNC: return 3;
+    case VT_STRUCT: return 3;
     case VT_FLOAT: return 2;
     case VT_DOUBLE: return 3;
     case VT_LDOUBLE: return 4;
     case VT_BOOL: return 0;
-    case VT_LLONG: return 3;
     }
     assert(0);
     return 0;
@@ -1005,8 +1010,6 @@ ST_FUNC void gfunc_prolog(Sym *func_sym)
     CType **t;
     unsigned long *a;
 
-    // Why doesn't the caller (gen_function) set func_vt?
-    func_vt = func_type->ref->type;
     func_vc = 144; // offset of where x8 is stored
 
     for (sym = func_type->ref; sym; sym = sym->next)

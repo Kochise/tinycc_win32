@@ -186,6 +186,14 @@ void * _Alignas(16) p1;
  _Static_assert(ONE == 0, "don't show me this");
  _Static_assert(ONE == 1, "ONE is not 1");
 
+#elif defined test_static_assert_2
+ _Static_assert(1, "1"" is 1");
+ _Static_assert(0, "0"" is 0");
+
+#elif defined test_static_assert_c2x
+ _Static_assert(1);
+ _Static_assert(0);
+
 #elif defined test_void_array
  void t[3];
 
@@ -299,6 +307,16 @@ void f2() {
 }
 struct yyy y, *yy;
 struct zzz { int z; } z, *zz;
+
+/******************************************************************/
+#elif defined test_long_double_type_for_win32
+
+int main()
+{
+    double *a = 0;
+    long double *b = a;
+    int n = _Generic(*a, double:0, long double:1);
+}
 
 /******************************************************************/
 #endif

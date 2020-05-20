@@ -1402,9 +1402,12 @@ ST_FUNC void label_pop(Sym **ptop, Sym *slast, int keep)
             }
         }
         /* remove label */
-        table_ident[s->v - TOK_IDENT]->sym_label = s->prev_tok;
+        if (s->r != LABEL_GONE)
+            table_ident[s->v - TOK_IDENT]->sym_label = s->prev_tok;
         if (!keep)
             sym_free(s);
+        else
+            s->r = LABEL_GONE;
     }
     if (!keep)
         *ptop = slast;
@@ -3147,7 +3150,7 @@ static int paste_tokens(int t1, CValue *v1, int t2, CValue *v2)
         if (is_space(tok))
             continue;
         tcc_warning("pasting \"%.*s\" and \"%s\" does not give a valid"
-            " preprocessing token", n, cstr.data, (char*)cstr.data + n);
+            " preprocessing token", n, (char *)cstr.data, (char*)cstr.data + n);
         ret = 0;
         break;
     }
@@ -3608,6 +3611,8 @@ ST_FUNC void preprocess_start(TCCState *s1, int is_asm)
         cstr_printf(&cstr, "#define __ASSEMBLER__ 1\n");
     if (s1->output_type == TCC_OUTPUT_MEMORY)
         cstr_printf(&cstr, "#define __TCC_RUN__ 1\n");
+    if (!is_asm && s1->output_type != TCC_OUTPUT_PREPROCESS)
+        cstr_cat(&cstr, "#include \"tcc_predefs.h\"\n", -1);
     if (s1->cmdline_incl.size)
         cstr_cat(&cstr, s1->cmdline_incl.data, s1->cmdline_incl.size);
     //printf("%s\n", (char*)cstr.data);

@@ -3,8 +3,6 @@
  */
 #include "config.h"
 
-#if GCC_MAJOR >= 3
-
 /* Unfortunately, gcc version < 3 does not handle that! */
 #define ALL_ISOC99
 
@@ -14,7 +12,11 @@
 /* gcc 2.95.3 does not handle correctly CR in strings or after strays */
 #define CORRECT_CR_HANDLING
 
-#endif
+/* __VA_ARGS__ and __func__ support */
+#define C99_MACROS
+
+/* deprecated and no longer supported in gcc 3.3 */
+//#define ACCEPT_CR_IN_STRINGS
 
 #ifndef __TINYC__
 typedef __SIZE_TYPE__ uintptr_t;
@@ -36,12 +38,6 @@ typedef __SIZE_TYPE__ uintptr_t;
 #define LONG_DOUBLE long double
 #define LONG_DOUBLE_LITERAL(x) x ## L
 #endif
-
-/* deprecated and no longer supported in gcc 3.3 */
-//#define ACCEPT_CR_IN_STRINGS
-
-/* __VA_ARGS__ and __func__ support */
-#define C99_MACROS
 
 /* test various include syntaxes */
 
@@ -2118,7 +2114,7 @@ void c99_bool_test(void)
 {
 #ifdef BOOL_ISOC99
     int a;
-    _Bool b;
+    _Bool b, b2;
 
     printf("bool_test:\n");
     printf("sizeof(_Bool) = %d\n", sizeof(_Bool));
@@ -2128,6 +2124,9 @@ void c99_bool_test(void)
     printf("b = %d\n", b);
     b++;
     printf("b = %d\n", b);
+    b2 = 0;
+    printf("sizeof(x ? _Bool : _Bool) = %d (should be sizeof int)\n",
+           sizeof((volatile)a ? b : b2));
 #endif
 }
 
@@ -2397,7 +2396,11 @@ int fib(int n)
         return fib(n-1) + fib(n-2);
 }
 
+#if __GNUC__ == 3
+# define aligned_function 0
+#else
 void __attribute__((aligned(16))) aligned_function(int i) {}
+#endif
 
 void funcptr_test()
 {
@@ -2677,6 +2680,18 @@ void manyarg_test(void)
            0.1, 1.2, 2.3, 3.4, 4.5, 5.6, 6.7, 7.8, 8.9, 9.0,
            ld, 1234567891234LL, 987654321986LL,
            42.0, 43.0, ld);
+}
+
+void*
+va_arg_with_struct_ptr(va_list ap) {
+        /*
+         * This was a BUG identified with FFTW-3.3.8 on arm64.
+         * The test case only checks it compiles on all supported
+         * architectures. This function is not currently called.
+         */
+        struct X { int _x; };
+        struct X *x = va_arg(ap, struct X *);
+        return x;
 }
 
 void vprintf1(const char *fmt, ...)
@@ -3127,6 +3142,22 @@ void statement_expr_test(void)
 
     /* Test that we can give out addresses of local labels.  */
     consume_ulong(({ __label__ __here; __here: (unsigned long)&&__here; }));
+
+    /* Test interaction between local and global label stacks and the
+       need to defer popping symbol from them when within statement
+       expressions.  Note how the labels are both named LBL.  */
+    i = 0;
+    ({
+      {
+        __label__ LBL;
+       LBL: if (i++ == 0) goto LBL;
+      }
+      /* jump to a classical label out of an expr-stmt that had previously
+         overshadowed that classical label */
+      goto LBL;
+    });
+  LBL:
+    printf("stmtexpr: %d should be 2\n", i);
 }
 
 void local_label_test(void)

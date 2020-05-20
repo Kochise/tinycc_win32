@@ -25,6 +25,10 @@ endif
 ifeq (,$(filter i386 x86_64,$(ARCH)))
  SKIP += 85_asm-outside-function.test
  SKIP += 112_backtrace.test 113_btdll.test
+ SKIP += 114_bound_signal.test
+endif
+ifeq (-$(CONFIG_musl)-,-yes-)
+ SKIP += 112_backtrace.test
 endif
 ifeq (-$(findstring gcc,$(CC))-,--)
  SKIP += $(patsubst %.expect,%.test,$(GEN-ALWAYS))
@@ -32,8 +36,11 @@ endif
 ifeq (-$(CONFIG_WIN32)-$(CONFIG_i386)$(CONFIG_arm)-,--yes-)
  SKIP += 95_bitfields%.test # type_align is different on 32bit-non-windows
 endif
-ifneq (-$(CONFIG_WIN32)$(CONFIG_WIN64)-,--)
+ifeq (-$(CONFIG_WIN32)-,-yes-)
  SKIP += 106_pthread.test # No pthread support
+endif
+ifneq (-$(CONFIG_WIN32)-$(findstring $(GCC_MAJOR),3 4)-,---)
+ SKIP += 114_bound_signal.test # not on windows or older linuxes
 endif
 
 # Some tests might need arguments
@@ -83,10 +90,13 @@ GEN-ALWAYS =
     -bt $1 -shared -D DLL=2 -o a2$(DLLSUF) && $(TCC) \
     -bt a1$(DLLSUF) a2$(DLLSUF) -Wl,-rpath=.
 
+114_bound_signal.test: FLAGS += -b
+
 # Filter source directory in warnings/errors (out-of-tree builds)
 FILTER = 2>&1 | sed -e 's,$(SRC)/,,g'
 
-all test tests2.all: $(filter-out $(SKIP),$(TESTS)) ;
+all test tests2.all: $(filter-out $(SKIP),$(TESTS))
+	@$(MAKE) clean --no-print-directory -s
 
 %.test: %.c %.expect
 	@echo Test: $*...
@@ -133,5 +143,5 @@ MS-CC = cl
 $(sort $(GEN-ALWAYS) $(UPDATE)) : force
 force:
 
-clean tests2.clean :
+clean :
 	rm -f fred.txt *.output a.exe *.dll *.so *.def $(GEN-ALWAYS)

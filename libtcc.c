@@ -919,14 +919,18 @@ LIBTCCAPI TCCState *tcc_new(void)
     tcc_define_symbol(s, "__REDIRECT_NTH(name, proto, alias)",
         "name proto __asm__ (#alias) __THROW");
 # endif
-# if defined(TCC_MUSL)
-    tcc_define_symbol(s, "__DEFINED_va_list", "");
-    tcc_define_symbol(s, "__DEFINED___isoc_va_list", "");
-    tcc_define_symbol(s, "__isoc_va_list", "void *");
-# endif /* TCC_MUSL */
     /* Some GCC builtins that are simple to express as macros.  */
     tcc_define_symbol(s, "__builtin_extract_return_addr(x)", "x");
 #endif /* ndef TCC_TARGET_PE */
+#ifdef TCC_TARGET_MACHO
+    /* emulate APPLE-GCC to make libc's headerfiles compile: */
+    tcc_define_symbol(s, "__APPLE__", "1");
+    tcc_define_symbol(s, "__GNUC__", "4");   /* darwin emits warning on GCC<4 */
+
+    /* avoids usage of GCC/clang specific builtins in libc-headerfiles: */
+    tcc_define_symbol(s, "__FINITE_MATH_ONLY__", "1");
+    tcc_define_symbol(s, "_FORTIFY_SOURCE", "0");
+#endif /* ndef TCC_TARGET_MACHO */
     return s;
 }
 
@@ -1539,6 +1543,7 @@ static const TCCOption tcc_options[] = {
     { "?", TCC_OPTION_HELP, 0 },
     { "hh", TCC_OPTION_HELP2, 0 },
     { "v", TCC_OPTION_v, TCC_OPTION_HAS_ARG | TCC_OPTION_NOSEP },
+    { "-version", TCC_OPTION_v, 0 }, /* handle as verbose, also prints version*/
     { "I", TCC_OPTION_I, TCC_OPTION_HAS_ARG },
     { "D", TCC_OPTION_D, TCC_OPTION_HAS_ARG },
     { "U", TCC_OPTION_U, TCC_OPTION_HAS_ARG },

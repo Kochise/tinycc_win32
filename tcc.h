@@ -24,9 +24,9 @@
 #define _GNU_SOURCE
 #include "config.h"
 
+#include <stdarg.h>
 #include <stdlib.h>
 #include <stdio.h>
-#include <stdarg.h>
 #include <string.h>
 #include <errno.h>
 #include <math.h>
@@ -46,6 +46,7 @@ extern long double strtold (const char *__nptr, char **__endptr);
 #endif
 
 #ifdef _WIN32
+# define WIN32_LEAN_AND_MEAN
 # include <windows.h>
 # include <io.h> /* open, close etc. */
 # include <direct.h> /* getcwd */
@@ -98,9 +99,11 @@ extern long double strtold (const char *__nptr, char **__endptr);
 #ifdef _MSC_VER
 # define NORETURN __declspec(noreturn)
 # define ALIGNED(x) __declspec(align(x))
+# define PRINTF_LIKE(x,y)
 #else
 # define NORETURN __attribute__((noreturn))
 # define ALIGNED(x) __attribute__((aligned(x)))
+# define PRINTF_LIKE(x,y) __attribute__ ((format (printf, (x), (y))))
 #endif
 
 /* gnu headers use to #define __attribute__ to empty for non-gcc compilers */
@@ -575,6 +578,8 @@ typedef struct DLLReference {
 #define LABEL_DEFINED  0 /* label is defined */
 #define LABEL_FORWARD  1 /* label is forward defined */
 #define LABEL_DECLARED 2 /* label is declared but never used */
+#define LABEL_GONE     3 /* label isn't in scope, but not yet popped
+                            from local_label_stack (stmt exprs) */
 
 /* type_decl() types */
 #define TYPE_ABSTRACT  1 /* type without variable */
@@ -1203,9 +1208,9 @@ PUB_FUNC char *tcc_strdup_debug(const char *str, const char *file, int line);
 #define realloc(p, s) use_tcc_realloc(p, s)
 #undef strdup
 #define strdup(s) use_tcc_strdup(s)
-PUB_FUNC void _tcc_error_noabort(const char *fmt, ...);
-PUB_FUNC NORETURN void _tcc_error(const char *fmt, ...);
-PUB_FUNC void _tcc_warning(const char *fmt, ...);
+PUB_FUNC void _tcc_error_noabort(const char *fmt, ...) PRINTF_LIKE(1,2);
+PUB_FUNC NORETURN void _tcc_error(const char *fmt, ...) PRINTF_LIKE(1,2);
+PUB_FUNC void _tcc_warning(const char *fmt, ...) PRINTF_LIKE(1,2);
 
 /* other utilities */
 ST_FUNC void dynarray_add(void *ptab, int *nb_ptr, void *data);
@@ -1215,7 +1220,7 @@ ST_FUNC void cstr_cat(CString *cstr, const char *str, int len);
 ST_FUNC void cstr_wccat(CString *cstr, int ch);
 ST_FUNC void cstr_new(CString *cstr);
 ST_FUNC void cstr_free(CString *cstr);
-ST_FUNC int cstr_printf(CString *cs, const char *fmt, ...);
+ST_FUNC int cstr_printf(CString *cs, const char *fmt, ...) PRINTF_LIKE(2,3);
 ST_FUNC void cstr_reset(CString *cstr);
 
 ST_INLN void sym_free(Sym *sym);

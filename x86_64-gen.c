@@ -146,6 +146,16 @@ ST_DATA const int reg_classes[NB_REGS] = {
 static unsigned long func_sub_sp_offset;
 static int func_ret_sub;
 
+#if defined(CONFIG_TCC_BCHECK)
+static addr_t func_bound_offset;
+static unsigned long func_bound_ind;
+static int func_bound_alloca_used;
+#endif
+
+#ifdef TCC_TARGET_PE
+static int func_scratch, func_alloca;
+#endif
+
 /* XXX: make it faster ? */
 ST_FUNC void g(int c)
 {
@@ -626,6 +636,10 @@ static void gcall_or_jmp(int is_jmp)
         greloca(cur_text_section, vtop->sym, ind + 1, R_X86_64_PLT32, (int)(vtop->c.i-4));
 #endif
         oad(0xe8 + is_jmp, 0); /* call/jmp im */
+#ifdef CONFIG_TCC_BCHECK
+        if (tcc_state->do_bounds_check && vtop->sym->v == TOK_alloca)
+            func_bound_alloca_used = 1;
+#endif
     } else {
         /* otherwise, indirect call */
         r = TREG_R11;
@@ -637,8 +651,6 @@ static void gcall_or_jmp(int is_jmp)
 }
 
 #if defined(CONFIG_TCC_BCHECK)
-static addr_t func_bound_offset;
-static unsigned long func_bound_ind;
 
 static void gen_bounds_call(int v)
 {
@@ -713,6 +725,7 @@ static void gen_bounds_prolog(void)
     /* leave some room for bound checking code */
     func_bound_offset = lbounds_section->data_offset;
     func_bound_ind = ind;
+    func_bound_alloca_used = 0;
     o(0xb848 + TREG_FASTCALL_1 * 0x100); /*lbound section pointer */
     gen_le64 (0);
     oad(0xb8, 0); /* call to function */
@@ -723,6 +736,9 @@ static void gen_bounds_epilog(void)
     addr_t saved_ind;
     addr_t *bounds_ptr;
     Sym *sym_data;
+
+    if (func_bound_offset == lbounds_section->data_offset && !func_bound_alloca_used)
+        return;
 
     /* add end of table info */
     bounds_ptr = section_ptr_add(lbounds_section, sizeof(addr_t));
@@ -749,8 +765,6 @@ static void gen_bounds_epilog(void)
 #endif
 
 #ifdef TCC_TARGET_PE
-
-static int func_scratch, func_alloca;
 
 #define REGN 4
 static const uint8_t arg_regs[REGN] = {
@@ -948,7 +962,6 @@ void gfunc_call(int nb_args)
         if (tcc_state->do_bounds_check)
             gen_bounds_call(TOK___bound_alloca_nr); /* new region */
 #endif
-
     }
     vtop--;
 }
@@ -978,8 +991,6 @@ void gfunc_prolog(Sym *func_sym)
 
     /* if the function returns a structure, then add an
        implicit pointer parameter */
-    func_vt = sym->type;
-    func_var = (sym->f.func_type == FUNC_ELLIPSIS);
     size = gfunc_arg_size(&func_vt);
     if (!using_regs(size)) {
         gen_modrm64(0x89, arg_regs[reg_param_index], VT_LOCAL, NULL, addr);
@@ -1019,7 +1030,7 @@ void gfunc_prolog(Sym *func_sym)
     }
 
     while (reg_param_index < REGN) {
-        if (func_type->ref->f.func_type == FUNC_ELLIPSIS) {
+        if (func_var) {
             gen_modrm64(0x89, arg_regs[reg_param_index], VT_LOCAL, NULL, addr);
             addr += 8;
         }
@@ -1478,7 +1489,7 @@ void gfunc_prolog(Sym *func_sym)
     func_sub_sp_offset = ind;
     func_ret_sub = 0;
 
-    if (sym->f.func_type == FUNC_ELLIPSIS) {
+    if (func_var) {
         int seen_reg_num, seen_sse_num, seen_stack_size;
         seen_reg_num = seen_sse_num = 0;
         /* frame pointer and return address */
@@ -1508,16 +1519,23 @@ void gfunc_prolog(Sym *func_sym)
             }
         }
 
-        loc -= 16;
-        /* movl $0x????????, -0x10(%rbp) */
-        o(0xf045c7);
+        loc -= 24;
+        /* movl $0x????????, -0x18(%rbp) */
+        o(0xe845c7);
         gen_le32(seen_reg_num * 8);
-        /* movl $0x????????, -0xc(%rbp) */
-        o(0xf445c7);
+        /* movl $0x????????, -0x14(%rbp) */
+        o(0xec45c7);
         gen_le32(seen_sse_num * 16 + 48);
-        /* movl $0x????????, -0x8(%rbp) */
-        o(0xf845c7);
-        gen_le32(seen_stack_size);
+	/* leaq $0x????????, %r11 */
+	o(0x9d8d4c);
+	gen_le32(seen_stack_size);
+	/* movq %r11, -0x10(%rbp) */
+	o(0xf05d894c);
+	/* leaq $-192(%rbp), %r11 */
+	o(0x9d8d4c);
+	gen_le32(-176 - 24);
+	/* movq %r11, -0x8(%rbp) */
+	o(0xf85d894c);
 
         /* save all register passing arguments */
         for (i = 0; i < 8; i++) {
@@ -1542,7 +1560,6 @@ void gfunc_prolog(Sym *func_sym)
 
     /* if the function returns a structure, then add an
        implicit pointer parameter */
-    func_vt = sym->type;
     mode = classify_x86_64_arg(&func_vt, NULL, &size, &align, &reg_count);
     if (mode == x86_64_mode_memory) {
         push_arg_reg(reg_param_index);

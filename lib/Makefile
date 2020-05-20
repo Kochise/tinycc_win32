@@ -15,6 +15,7 @@ XFLAGS-unx = -B$(TOPSRC)
 XFLAGS-win = -B$(TOPSRC)/win32 -I$(TOPSRC)/include
 XFLAGS = $(XFLAGS$(XCFG)) -I$(TOP)
 XCFG = $(or $(findstring -win,$T),-unx)
+S = $(if $(findstring yes,$(SILENT)),@$(info * $@))
 
 # in order to use gcc, tyoe: make <target>-libtcc1-usegcc=yes
 arm-libtcc1-usegcc ?= no
@@ -34,10 +35,6 @@ ifeq ($(CONFIG_musl)$(CONFIG_uClibc),yes)
  BCHECK_O =
 else
  DSO_O = dsohandle.o
-endif
-
-ifdef CONFIG_OSX
- XFLAGS += -D_ANSI_SOURCE
 endif
 
 I386_O = libtcc1.o alloca86.o alloca86-bt.o $(BT_O)
@@ -70,16 +67,16 @@ ALL = $(addprefix $(TOP)/,$(X)libtcc1.a $(OBJ-extra))
 all: $(ALL)
 
 $(TOP)/$(X)libtcc1.a : $(OBJ-libtcc1)
-	$(XAR) rcs $@ $^
+	$S$(XAR) rcs $@ $^
 
 $(X)%.o : %.c
-	$(XCC) -c $< -o $@ $(XFLAGS)
+	$S$(XCC) -c $< -o $@ $(XFLAGS)
 
 $(X)%.o : %.S
-	$(XCC) -c $< -o $@ $(XFLAGS)
+	$S$(XCC) -c $< -o $@ $(XFLAGS)
 
 $(TOP)/%.o : %.c
-	$(XCC) -c $< -o $@ $(XFLAGS)
+	$S$(XCC) -c $< -o $@ $(XFLAGS)
 
 $(TOP)/bcheck.o : XFLAGS += -g
 $(TOP)/bt-exe.o : $(TOP)/tccrun.c

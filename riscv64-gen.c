@@ -627,7 +627,6 @@ ST_FUNC void gfunc_prolog(Sym *func_sym)
     CType *type;
 
     sym = func_type->ref;
-    func_vt = sym->type;
     loc = -16; // for ra and s0
     func_sub_sp_offset = ind;
     ind += 5 * 4;
@@ -686,7 +685,7 @@ ST_FUNC void gfunc_prolog(Sym *func_sym)
     }
     func_va_list_ofs = addr;
     num_va_regs = 0;
-    if (func_type->ref->f.func_type == FUNC_ELLIPSIS) {
+    if (func_var) {
         for (; areg[0] < 8; areg[0]++) {
             num_va_regs++;
             ES(0x23, 3, 8, 10 + areg[0], -8 + num_va_regs * 8); // sd aX, loc(s0)
@@ -1176,9 +1175,9 @@ ST_FUNC void gen_cvt_ftof(int dt)
         rs = gv(RC_FLOAT);
         rd = get_reg(RC_FLOAT);
         if (dt == VT_DOUBLE)
-          EI(0x53, 7, freg(rd), freg(rs), 0x21 << 5); // fcvt.d.s RD, RS (dyn rm)
+          EI(0x53, 0, freg(rd), freg(rs), 0x21 << 5); // fcvt.d.s RD, RS (no rm)
         else
-          EI(0x53, 7, freg(rd), freg(rs), (0x20 << 5) | 1); // fcvt.s.d RD, RS
+          EI(0x53, 7, freg(rd), freg(rs), (0x20 << 5) | 1); // fcvt.s.d RD, RS (dyn rm)
         vtop->r = rd;
     }
 }
