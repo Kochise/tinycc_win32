@@ -91,6 +91,7 @@
      DEF(TOK___FUNCTION__, "__FUNCTION__")
      DEF(TOK___VA_ARGS__, "__VA_ARGS__")
      DEF(TOK___COUNTER__, "__COUNTER__")
+     DEF(TOK___HAS_INCLUDE, "__has_include")
 
 /* special identifiers */
      DEF(TOK___FUNC__, "__func__")
@@ -131,6 +132,12 @@
      DEF(TOK_CONSTRUCTOR2, "__constructor__")
      DEF(TOK_DESTRUCTOR1, "destructor")
      DEF(TOK_DESTRUCTOR2, "__destructor__")
+     DEF(TOK_ALWAYS_INLINE1, "always_inline")
+     DEF(TOK_ALWAYS_INLINE2, "__always_inline__")
+#ifdef CONFIG_TCC_BCHECK
+     DEF(TOK_NO_BOUND_CHECK1, "bound_no_checking")
+     DEF(TOK_NO_BOUND_CHECK2, "__bound_no_checking__")
+#endif
 
      DEF(TOK_MODE, "__mode__")
      DEF(TOK_MODE_QI, "__QI__")
@@ -205,9 +212,9 @@
 #if defined TCC_TARGET_ARM
 # ifdef TCC_ARM_EABI
      DEF(TOK_memcpy, "__aeabi_memcpy")
-     DEF(TOK_memcpy4, "__aeabi_memcpy4")
-     DEF(TOK_memcpy8, "__aeabi_memcpy8")
      DEF(TOK_memmove, "__aeabi_memmove")
+     DEF(TOK_memmove4, "__aeabi_memmove4")
+     DEF(TOK_memmove8, "__aeabi_memmove8")
      DEF(TOK_memset, "__aeabi_memset")
      DEF(TOK___aeabi_ldivmod, "__aeabi_ldivmod")
      DEF(TOK___aeabi_uldivmod, "__aeabi_uldivmod")
@@ -305,27 +312,19 @@
      DEF(TOK___bound_main_arg, "__bound_main_arg")
      DEF(TOK___bound_local_new, "__bound_local_new")
      DEF(TOK___bound_local_delete, "__bound_local_delete")
+     DEF(TOK___bound_setjmp, "__bound_setjmp")
+     DEF(TOK___bound_new_region, "__bound_new_region")
 # ifdef TCC_TARGET_PE
 #  ifdef TCC_TARGET_X86_64
      DEF(TOK___bound_alloca_nr, "__bound_alloca_nr")
 #  endif
-     DEF(TOK_malloc, "malloc")
-     DEF(TOK_free, "free")
-     DEF(TOK_realloc, "realloc")
-     DEF(TOK_memalign, "memalign")
-     DEF(TOK_calloc, "calloc")
+# else
+     DEF(TOK_sigsetjmp, "sigsetjmp")
+     DEF(TOK___sigsetjmp, "__sigsetjmp")
+     DEF(TOK_siglongjmp, "siglongjmp")
 # endif
-     DEF(TOK_mmap, "mmap")
-     DEF(TOK_munmap, "munmap")
-     DEF(TOK_memcmp, "memcmp")
-     DEF(TOK_strlen, "strlen")
-     DEF(TOK_strcpy, "strcpy")
-     DEF(TOK_strncpy, "strncpy")
-     DEF(TOK_strcmp, "strcmp")
-     DEF(TOK_strncmp, "strncmp")
-     DEF(TOK_strcat, "strcat")
-     DEF(TOK_strchr, "strchr")
-     DEF(TOK_strdup, "strdup")
+     DEF(TOK_setjmp, "setjmp")
+     DEF(TOK__setjmp, "_setjmp")
 #endif
 
 /* Tiny Assembler */

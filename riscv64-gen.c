@@ -2,6 +2,8 @@
 
 // Number of registers available to allocator:
 #define NB_REGS 19 // x10-x17 aka a0-a7, f10-f17 aka fa0-fa7, xxx, ra, sp
+#define NB_ASM_REGS 32
+#define CONFIG_TCC_ASM
 
 #define TREG_R(x) (x) // x = 0..7
 #define TREG_F(x) (x + 8) // x = 0..7
@@ -60,6 +62,12 @@ ST_DATA const int reg_classes[NB_REGS] = {
   1 << TREG_RA,
   1 << TREG_SP
 };
+
+#if defined(CONFIG_TCC_BCHECK)
+static addr_t func_bound_offset;
+static unsigned long func_bound_ind;
+ST_DATA int func_bound_add_epilog;
+#endif
 
 static int ireg(int r)
 {
@@ -158,7 +166,7 @@ static int load_symofs(int r, SValue *sv, int forstore)
             sv->c.i = 0;
         } else {
             if (((unsigned)fc + (1 << 11)) >> 12)
-              tcc_error("unimp: large addend for global address (0x%llx)", sv->c.i);
+              tcc_error("unimp: large addend for global address (0x%llx)", (long long)sv->c.i);
             greloca(cur_text_section, sv->sym, ind,
                     R_RISCV_GOT_HI20, 0);
             doload = 1;
@@ -199,9 +207,10 @@ ST_FUNC void load(int r, SValue *sv)
     int rr = is_ireg(r) ? ireg(r) : freg(r);
     int fc = sv->c.i;
     int bt = sv->type.t & VT_BTYPE;
-    int align, size = type_size(&sv->type, &align);
+    int align, size;
     if (fr & VT_LVAL) {
         int func3, opcode = is_freg(r) ? 0x07 : 0x03, br;
+        size = type_size(&sv->type, &align);
         assert (!is_freg(r) || bt == VT_FLOAT || bt == VT_DOUBLE);
         if (bt == VT_FUNC) /* XXX should be done in generic code */
           size = PTR_SIZE;
@@ -282,6 +291,7 @@ ST_FUNC void load(int r, SValue *sv)
           EI(0x13, 0, rr, ireg(v), 0); // addi RR, V, 0 == mv RR, V
         else {
             int func7 = is_ireg(r) ? 0x70 : 0x78;
+            size = type_size(&sv->type, &align);
             if (size == 8)
               func7 |= 1;
             assert(size == 4 || size == 8);
@@ -388,6 +398,80 @@ static void gcall_or_jmp(int docall)
     }
 }
 
+#if defined(CONFIG_TCC_BCHECK)
+
+static void gen_bounds_call(int v)
+{
+    Sym *sym = external_global_sym(v, &func_old_type);
+
+    greloca(cur_text_section, sym, ind, R_RISCV_CALL_PLT, 0);
+    o(0x17 | (1 << 7));   // auipc TR, 0 %call(func)
+    EI(0x67, 0, 1, 1, 0); // jalr  TR, r(TR)
+}
+
+static void gen_bounds_prolog(void)
+{
+    /* leave some room for bound checking code */
+    func_bound_offset = lbounds_section->data_offset;
+    func_bound_ind = ind;
+    func_bound_add_epilog = 0;
+    o(0x00000013);  /* ld a0,#lbound section pointer */
+    o(0x00000013);
+    o(0x00000013);  /* nop -> call __bound_local_new */
+    o(0x00000013);
+}
+
+static void gen_bounds_epilog(void)
+{
+    static Sym label;
+    addr_t saved_ind;
+    addr_t *bounds_ptr;
+    Sym *sym_data;
+    int offset_modified = func_bound_offset != lbounds_section->data_offset;
+
+    if (!offset_modified && !func_bound_add_epilog)
+        return;
+
+    /* add end of table info */
+    bounds_ptr = section_ptr_add(lbounds_section, sizeof(addr_t));
+    *bounds_ptr = 0;
+
+    sym_data = get_sym_ref(&char_pointer_type, lbounds_section,
+                           func_bound_offset, lbounds_section->data_offset);
+
+    if (!label.v) {
+        label.v = tok_alloc(".LB0 ", 4)->tok;
+        label.type.t = VT_VOID | VT_STATIC;
+    }
+    /* generate bound local allocation */
+    if (offset_modified) {
+        saved_ind = ind;
+        ind = func_bound_ind;
+        label.c = 0; /* force new local ELF symbol */
+        put_extern_sym(&label, cur_text_section, ind, 0);
+        greloca(cur_text_section, sym_data, ind, R_RISCV_GOT_HI20, 0);
+        o(0x17 | (10 << 7));    // auipc a0, 0 %pcrel_hi(sym)+addend
+        greloca(cur_text_section, &label, ind, R_RISCV_PCREL_LO12_I, 0);
+        EI(0x03, 3, 10, 10, 0); // ld a0, 0(a0)
+        gen_bounds_call(TOK___bound_local_new);
+        ind = saved_ind;
+    }
+
+    /* generate bound check local freeing */
+    o(0xe02a1101); /* addi sp,sp,-32  sd   a0,0(sp)   */
+    o(0xa82ae42e); /* sd   a1,8(sp)   fsd  fa0,16(sp) */
+    label.c = 0; /* force new local ELF symbol */
+    put_extern_sym(&label, cur_text_section, ind, 0);
+    greloca(cur_text_section, sym_data, ind, R_RISCV_GOT_HI20, 0);
+    o(0x17 | (10 << 7));    // auipc a0, 0 %pcrel_hi(sym)+addend
+    greloca(cur_text_section, &label, ind, R_RISCV_PCREL_LO12_I, 0);
+    EI(0x03, 3, 10, 10, 0); // ld a0, 0(a0)
+    gen_bounds_call(TOK___bound_local_delete);
+    o(0x65a26502); /* ld   a0,0(sp)   ld   a1,8(sp)   */
+    o(0x61052542); /* fld  fa0,16(sp) addi sp,sp,32   */
+}
+#endif
+
 static void reg_pass_rec(CType *type, int *rc, int *fieldofs, int ofs)
 {
     if ((type->t & VT_BTYPE) == VT_STRUCT) {
@@ -436,10 +520,16 @@ static void reg_pass(CType *type, int *prc, int *fieldofs, int named)
 ST_FUNC void gfunc_call(int nb_args)
 {
     int i, align, size, areg[2];
-    int info[nb_args ? nb_args : 1];
-    int stack_adj = 0, tempspace = 0, ofs, splitofs = 0;
+    int *info = tcc_malloc((nb_args + 1) * sizeof (int));
+    int stack_adj = 0, tempspace = 0, stack_add, ofs, splitofs = 0;
     SValue *sv;
     Sym *sa;
+
+#ifdef CONFIG_TCC_BCHECK
+    if (tcc_state->do_bounds_check)
+        gbound_args(nb_args);
+#endif
+
     areg[0] = 0; /* int arg regs */
     areg[1] = 8; /* float arg regs */
     sa = vtop[-nb_args].type.ref->next;
@@ -498,8 +588,15 @@ ST_FUNC void gfunc_call(int nb_args)
     }
     stack_adj = (stack_adj + 15) & -16;
     tempspace = (tempspace + 15) & -16;
-    if (stack_adj + tempspace) {
-        EI(0x13, 0, 2, 2, -(stack_adj + tempspace));   // addi sp, sp, -adj
+    stack_add = stack_adj + tempspace;
+    if (stack_add) {
+        if (stack_add >= 0x1000) {
+            o(0x37 | (5 << 7) | (-stack_add & 0xfffff000)); //lui t0, upper(v)
+            EI(0x13, 0, 5, 5, -stack_add << 20 >> 20); // addi t0, t0, lo(v)
+            ER(0x33, 0, 2, 2, 5, 0); // add sp, sp, t0
+        }
+        else
+            EI(0x13, 0, 2, 2, -stack_add);   // addi sp, sp, -adj
         for (i = ofs = 0; i < nb_args; i++) {
             if (info[i] & (64 | 32)) {
                 vrotb(nb_args - i);
@@ -611,8 +708,16 @@ ST_FUNC void gfunc_call(int nb_args)
     save_regs(nb_args + 1);
     gcall_or_jmp(1);
     vtop -= nb_args + 1;
-    if (stack_adj + tempspace)
-      EI(0x13, 0, 2, 2, stack_adj + tempspace);      // addi sp, sp, adj
+    if (stack_add) {
+        if (stack_add >= 0x1000) {
+            o(0x37 | (5 << 7) | (stack_add & 0xfffff000)); //lui t0, upper(v)
+            EI(0x13, 0, 5, 5, stack_add << 20 >> 20); // addi t0, t0, lo(v)
+            ER(0x33, 0, 2, 2, 5, 0); // add sp, sp, t0
+        }
+        else
+            EI(0x13, 0, 2, 2, stack_add);      // addi sp, sp, adj
+   }
+   tcc_free(info);
 }
 
 static int func_sub_sp_offset, num_va_regs, func_va_list_ofs;
@@ -691,6 +796,10 @@ ST_FUNC void gfunc_prolog(Sym *func_sym)
             ES(0x23, 3, 8, 10 + areg[0], -8 + num_va_regs * 8); // sd aX, loc(s0)
         }
     }
+#ifdef CONFIG_TCC_BCHECK
+    if (tcc_state->do_bounds_check)
+        gen_bounds_prolog();
+#endif
 }
 
 ST_FUNC int gfunc_sret(CType *vt, int variadic, CType *ret,
@@ -731,6 +840,11 @@ ST_FUNC void arch_transfer_ret_regs(int aftercall)
 ST_FUNC void gfunc_epilog(void)
 {
     int v, saved_ind, d, large_ofs_ind;
+
+#ifdef CONFIG_TCC_BCHECK
+    if (tcc_state->do_bounds_check)
+        gen_bounds_epilog();
+#endif
 
     loc = (loc - num_va_regs * 8);
     d = v = (-loc + 15) & -16;
@@ -854,6 +968,7 @@ static void gen_opil(int op, int ll)
         int fc = vtop->c.i;
         if (fc == vtop->c.i && !(((unsigned)fc + (1 << 11)) >> 12)) {
             int cll = 0;
+            int m = ll ? 31 : 63;
             vswap();
             gv(RC_INT);
             a = ireg(vtop[0].r);
@@ -868,6 +983,7 @@ static void gen_opil(int op, int ll)
                     fc = -fc;
                 case '+':
                     func3 = 0; // addi d, a, fc
+                    cll = ll;
                 do_cop:
                     EI(0x13 | cll, func3, ireg(d), a, fc);
                     --vtop;
@@ -883,29 +999,29 @@ static void gen_opil(int op, int ll)
                     ++fc;
                 case TOK_LT:  func3 = 2; goto do_cop; // slti d, a, fc
                 case TOK_ULE:
-                    if (fc >= (1 << 11) - 1)
+                    if (fc >= (1 << 11) - 1 || fc == -1)
                       break;
                     ++fc;
                 case TOK_ULT: func3 = 3; goto do_cop; // sltiu d, a, fc
                 case '^':     func3 = 4; goto do_cop; // xori d, a, fc
                 case '|':     func3 = 6; goto do_cop; // ori  d, a, fc
                 case '&':     func3 = 7; goto do_cop; // andi d, a, fc
-                case TOK_SHL: func3 = 1; fc &= 63; goto do_cop; // slli d, a, fc
-                case TOK_SHR: func3 = 5; cll = ll; fc &= 63; goto do_cop; // srli d, a, fc
-                case TOK_SAR: func3 = 5; cll = ll; fc = 1024 | (fc & 63); goto do_cop;
+                case TOK_SHL: func3 = 1; cll = ll; fc &= m; goto do_cop; // slli d, a, fc
+                case TOK_SHR: func3 = 5; cll = ll; fc &= m; goto do_cop; // srli d, a, fc
+                case TOK_SAR: func3 = 5; cll = ll; fc = 1024 | (fc & m); goto do_cop;
 
-                case TOK_UGE:
-                case TOK_UGT:
-                case TOK_GE:
-                case TOK_GT:
-                    gen_opil(op - 1, ll);
+                case TOK_UGE: /* -> TOK_ULT */
+                case TOK_UGT: /* -> TOK_ULE */
+                case TOK_GE:  /* -> TOK_LT */
+                case TOK_GT:  /* -> TOK_LE */
+                    gen_opil(op - 1, !ll);
                     vtop->cmp_op ^= 1;
                     return;
 
                 case TOK_NE:
                 case TOK_EQ:
                     if (fc)
-                      gen_opil('-', ll), a = ireg(vtop++->r);
+                      gen_opil('-', !ll), a = ireg(vtop++->r);
                     --vtop;
                     vset_VT_CMP(op);
                     vtop->cmp_r = a | 0 << 8;
@@ -932,25 +1048,25 @@ static void gen_opil(int op, int ll)
         break;
 
     case '+':
-        ER(0x33, 0, d, a, b, 0); // add d, a, b
+        ER(0x33 | ll, 0, d, a, b, 0); // add d, a, b
         break;
     case '-':
-        ER(0x33, 0, d, a, b, 0x20); // sub d, a, b
+        ER(0x33 | ll, 0, d, a, b, 0x20); // sub d, a, b
         break;
     case TOK_SAR:
-        ER(0x33 | ll, 5, d, a, b, 0x20); // sra d, a, b
+        ER(0x33 | ll | ll, 5, d, a, b, 0x20); // sra d, a, b
         break;
     case TOK_SHR:
-        ER(0x33 | ll, 5, d, a, b, 0); // srl d, a, b
+        ER(0x33 | ll | ll, 5, d, a, b, 0); // srl d, a, b
         break;
     case TOK_SHL:
-        ER(0x33, 1, d, a, b, 0); // sll d, a, b
+        ER(0x33 | ll, 1, d, a, b, 0); // sll d, a, b
         break;
     case '*':
-        ER(0x33, 0, d, a, b, 1); // mul d, a, b
+        ER(0x33 | ll, 0, d, a, b, 1); // mul d, a, b
         break;
     case '/':
-        ER(0x33, 4, d, a, b, 1); // div d, a, b
+        ER(0x33 | ll, 4, d, a, b, 1); // div d, a, b
         break;
     case '&':
         ER(0x33, 7, d, a, b, 0); // and d, a, b
@@ -962,14 +1078,14 @@ static void gen_opil(int op, int ll)
         ER(0x33, 6, d, a, b, 0); // or d, a, b
         break;
     case '%':
-        ER(0x33, 6, d, a, b, 1); // rem d, a, b
+        ER(ll ? 0x3b:  0x33, 6, d, a, b, 1); // rem d, a, b
         break;
     case TOK_UMOD:
-        ER(0x33, 7, d, a, b, 1); // remu d, a, b
+        ER(0x33 | ll, 7, d, a, b, 1); // remu d, a, b
         break;
     case TOK_PDIV:
     case TOK_UDIV:
-        ER(0x33, 5, d, a, b, 1); // divu d, a, b
+        ER(0x33 | ll, 5, d, a, b, 1); // divu d, a, b
         break;
     }
 }
@@ -1200,10 +1316,27 @@ ST_FUNC void gen_vla_sp_restore(int addr)
 
 ST_FUNC void gen_vla_alloc(CType *type, int align)
 {
-    int rr = ireg(gv(RC_INT));
+    int rr;
+#if defined(CONFIG_TCC_BCHECK)
+    if (tcc_state->do_bounds_check)
+        vpushv(vtop);
+#endif
+    rr = ireg(gv(RC_INT));
     EI(0x13, 0, rr, rr, 15);   // addi RR, RR, 15
     EI(0x13, 7, rr, rr, -16);  // andi, RR, RR, -16
     ER(0x33, 0, 2, 2, rr, 0x20); // sub sp, sp, rr
     vpop();
+#if defined(CONFIG_TCC_BCHECK)
+    if (tcc_state->do_bounds_check) {
+        vpushi(0);
+        vtop->r = TREG_R(0);
+        o(0x00010513); /* mv a0,sp */
+        vswap();
+        vpush_global_sym(&func_old_type, TOK___bound_new_region);
+        vrott(3);
+        gfunc_call(2);
+        func_bound_add_epilog = 1;
+    }
+#endif
 }
 #endif

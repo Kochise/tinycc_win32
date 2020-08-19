@@ -92,7 +92,7 @@ static const unsigned char tok_two_chars[] =
     0
 };
 
-static void next_nomacro_spc(void);
+static void next_nomacro(void);
 
 ST_FUNC void skip(int c)
 {
@@ -261,7 +261,7 @@ tail_call:
             al->p += adj_size + sizeof(tal_header_t);
             if (is_own) {
                 header = (((tal_header_t *)p) - 1);
-                memcpy(ret, p, header->size);
+                if (p) memcpy(ret, p, header->size);
 #ifdef TAL_DEBUG
                 header->line_num = -header->line_num;
 #endif
@@ -280,7 +280,7 @@ tail_call:
             al->nb_allocs--;
             ret = tal_realloc(*pal, 0, size);
             header = (((tal_header_t *)p) - 1);
-            memcpy(ret, p, header->size);
+            if (p) memcpy(ret, p, header->size);
 #ifdef TAL_DEBUG
             header->line_num = -header->line_num;
 #endif
@@ -301,7 +301,7 @@ tail_call:
         al->nb_allocs--;
         ret = tcc_malloc(size);
         header = (((tal_header_t *)p) - 1);
-        memcpy(ret, p, header->size);
+        if (p) memcpy(ret, p, header->size);
 #ifdef TAL_DEBUG
         header->line_num = -header->line_num;
 #endif
@@ -1230,7 +1230,7 @@ ST_FUNC void tok_str_add_tok(TokenString *s)
 }
 
 /* get a token from an integer array and increment pointer. */
-static inline void TOK_GET(int *t, const int **pp, CValue *cv)
+static inline void tok_get(int *t, const int **pp, CValue *cv)
 {
     const int *p = *pp;
     int n, *tab;
@@ -1292,6 +1292,18 @@ static inline void TOK_GET(int *t, const int **pp, CValue *cv)
     }
     *pp = p;
 }
+
+#if 0
+# define TOK_GET(t,p,c) tok_get(t,p,c)
+#else
+# define TOK_GET(t,p,c) do { \
+    int _t = **(p); \
+    if (TOK_HAS_VALUE(_t)) \
+        tok_get(t, p, c); \
+    else \
+        *(t) = _t, ++*(p); \
+    } while (0)
+#endif
 
 static int macro_is_equal(const int *a, const int *b)
 {
@@ -1424,7 +1436,7 @@ static void maybe_run_test(TCCState *s)
         return;
     if (0 != --s->run_test)
         return;
-    fprintf(s->ppfp, "\n[%s]\n" + !(s->dflag & 32), p), fflush(s->ppfp);
+    fprintf(s->ppfp, &"\n[%s]\n"[!(s->dflag & 32)], p), fflush(s->ppfp);
     define_push(tok, MACRO_OBJ, NULL, NULL);
 }
 
@@ -1438,6 +1450,7 @@ static int expr_preprocess(void)
     pp_expr = 1;
     while (tok != TOK_LINEFEED && tok != TOK_EOF) {
         next(); /* do macro subst */
+      redo:
         if (tok == TOK_DEFINED) {
             next_nomacro();
             t = tok;
@@ -1455,10 +1468,26 @@ static int expr_preprocess(void)
             }
             tok = TOK_CINT;
             tokc.i = c;
-        } else if (tok >= TOK_IDENT) {
-            /* if undefined macro */
+        } else if (1 && tok == TOK___HAS_INCLUDE) {
+            next();  /* XXX check if correct to use expansion */
+            skip('(');
+            while (tok != ')' && tok != TOK_EOF)
+              next();
+            if (tok != ')')
+              expect("')'");
             tok = TOK_CINT;
             tokc.i = 0;
+        } else if (tok >= TOK_IDENT) {
+            /* if undefined macro, replace with zero, check for func-like */
+            t = tok;
+            tok = TOK_CINT;
+            tokc.i = 0;
+            tok_str_add_tok(str);
+            next();
+            if (tok == '(')
+                tcc_error("function-like macro '%s' is not defined",
+                          get_tok_str(t, NULL));
+            goto redo;
         }
         tok_str_add_tok(str);
     }
@@ -1493,7 +1522,8 @@ ST_FUNC void parse_define(void)
        character.  */
     parse_flags = ((parse_flags & ~PARSE_FLAG_ASM_FILE) | PARSE_FLAG_SPACES);
     /* '(' must be just after macro definition for MACRO_FUNC */
-    next_nomacro_spc();
+    next_nomacro();
+    parse_flags &= ~PARSE_FLAG_SPACES;
     if (tok == '(') {
         int dotid = set_idnum('.', 0);
         next_nomacro();
@@ -1521,7 +1551,8 @@ ST_FUNC void parse_define(void)
                 goto bad_list;
             next_nomacro();
         }
-        next_nomacro_spc();
+        parse_flags |= PARSE_FLAG_SPACES;
+        next_nomacro();
         t = MACRO_FUNC;
         set_idnum('.', dotid);
     }
@@ -1550,7 +1581,7 @@ ST_FUNC void parse_define(void)
         }
         tok_str_add2(&tokstr_buf, tok, &tokc);
     skip:
-        next_nomacro_spc();
+        next_nomacro();
     }
 
     parse_flags = saved_parse_flags;
@@ -1808,7 +1839,7 @@ ST_FUNC void preprocess(int is_bof)
             tcc_error("#include recursion too deep");
         /* push current file on stack */
         *s1->include_stack_ptr++ = file;
-        i = tok == TOK_INCLUDE_NEXT ? file->include_next_index: 0;
+        i = tok == TOK_INCLUDE_NEXT ? file->include_next_index + 1 : 0;
         n = 2 + s1->nb_include_paths + s1->nb_sysinclude_paths;
         for (; i < n; ++i) {
             char buf1[sizeof file->filename];
@@ -1851,14 +1882,19 @@ ST_FUNC void preprocess(int is_bof)
             if (tcc_open(s1, buf1) < 0)
                 continue;
 
-            file->include_next_index = i + 1;
+            file->include_next_index = i;
 #ifdef INC_DEBUG
             printf("%s: including %s\n", file->prev->filename, file->filename);
 #endif
             /* update target deps */
             if (s1->gen_deps) {
-                dynarray_add(&s1->target_deps, &s1->nb_target_deps,
-                    tcc_strdup(buf1));
+                BufferedFile *bf = file;
+                while (i == 1 && (bf = bf->prev))
+                    i = bf->include_next_index;
+                /* skip system include files */
+                if (n - i > s1->nb_sysinclude_paths)
+                    dynarray_add(&s1->target_deps, &s1->nb_target_deps,
+                        tcc_strdup(buf1));
             }
             /* add include file debug info */
             tcc_debug_bincl(tcc_state);
@@ -2581,6 +2617,7 @@ static inline void next_nomacro1(void)
     case '\t':
         tok = c;
         p++;
+ maybe_space:
         if (parse_flags & PARSE_FLAG_SPACES)
             goto keep_tok_flags;
         while (isidnum_table[*p - CH_EOF] & IS_SPC)
@@ -2927,11 +2964,11 @@ maybe_newline:
             p = parse_comment(p);
             /* comments replaced by a blank */
             tok = ' ';
-            goto keep_tok_flags;
+            goto maybe_space;
         } else if (c == '/') {
             p = parse_line_comment(p);
             tok = ' ';
-            goto keep_tok_flags;
+            goto maybe_space;
         } else if (c == '=') {
             p++;
             tok = TOK_A_DIV;
@@ -2972,34 +3009,6 @@ keep_tok_flags:
     printf("token = %d %s\n", tok, get_tok_str(tok, &tokc));
 #endif
 }
-
-/* return next token without macro substitution. Can read input from
-   macro_ptr buffer */
-static void next_nomacro_spc(void)
-{
-    if (macro_ptr) {
-    redo:
-        tok = *macro_ptr;
-        if (tok) {
-            TOK_GET(&tok, &macro_ptr, &tokc);
-            if (tok == TOK_LINENUM) {
-                file->line_num = tokc.i;
-                goto redo;
-            }
-        }
-    } else {
-        next_nomacro1();
-    }
-    //printf("token = %s\n", get_tok_str(tok, &tokc));
-}
-
-ST_FUNC void next_nomacro(void)
-{
-    do {
-        next_nomacro_spc();
-    } while (tok < 256 && (isidnum_table[tok - CH_EOF] & IS_SPC));
-}
- 
 
 static void macro_subst(
     TokenString *tok_str,
@@ -3276,7 +3285,7 @@ static int next_argstream(Sym **nested_list, TokenString *ws_str)
 
         if (ws_str)
             return t;
-        next_nomacro_spc();
+        next_nomacro();
         return tok;
     }
 }
@@ -3367,7 +3376,7 @@ static int macro_subst_tok(
             }
 	    do {
 		next_nomacro(); /* eat '(' */
-	    } while (tok == TOK_PLCHLDR);
+	    } while (tok == TOK_PLCHLDR || is_space(tok));
 
             /* argument macro */
             args = NULL;
@@ -3425,8 +3434,6 @@ static int macro_subst_tok(
                       get_tok_str(s->v, 0));
             }
 
-            parse_flags = saved_parse_flags;
-
             /* now subst each arg */
             mstr = macro_arg_subst(nested_list, mstr, args);
             /* free memory */
@@ -3441,6 +3448,7 @@ static int macro_subst_tok(
                 sym_free(sa);
                 sa = sa1;
             }
+            parse_flags = saved_parse_flags;
         }
 
         sym_push2(nested_list, s->v, 0, 0);
@@ -3511,8 +3519,6 @@ static void macro_subst(
             if (tok_str->len)
                 spc = is_space(t = tok_str->str[tok_str->lastlen]);
         } else {
-            if (t == '\\' && !(parse_flags & PARSE_FLAG_ACCEPT_STRAYS))
-                tcc_error("stray '\\' in program");
 no_subst:
             if (!check_space(t, &spc))
                 tok_str_add2(tok_str, t, &cval);
@@ -3531,28 +3537,59 @@ no_subst:
     }
 }
 
+/* return next token without macro substitution. Can read input from
+   macro_ptr buffer */
+static void next_nomacro(void)
+{
+    int t;
+    if (macro_ptr) {
+ redo:
+        t = *macro_ptr;
+        if (TOK_HAS_VALUE(t)) {
+            tok_get(&tok, &macro_ptr, &tokc);
+            if (t == TOK_LINENUM) {
+                file->line_num = tokc.i;
+                goto redo;
+            }
+        } else {
+            macro_ptr++;
+            if (t < TOK_IDENT) {
+                if (!(parse_flags & PARSE_FLAG_SPACES)
+                    && (isidnum_table[t - CH_EOF] & IS_SPC))
+                    goto redo;
+            }
+            tok = t;
+        }
+    } else {
+        next_nomacro1();
+    }
+}
+
 /* return next token with macro substitution */
 ST_FUNC void next(void)
 {
+    int t;
  redo:
-    if (parse_flags & PARSE_FLAG_SPACES)
-        next_nomacro_spc();
-    else
-        next_nomacro();
-
+    next_nomacro();
+    t = tok;
     if (macro_ptr) {
-        if (tok == TOK_NOSUBST || tok == TOK_PLCHLDR) {
-        /* discard preprocessor markers */
-            goto redo;
-        } else if (tok == 0) {
-            /* end of macro or unget token string */
-            end_macro();
-            goto redo;
+        if (!TOK_HAS_VALUE(t)) {
+            if (t == TOK_NOSUBST || t == TOK_PLCHLDR) {
+                /* discard preprocessor markers */
+                goto redo;
+            } else if (t == 0) {
+                /* end of macro or unget token string */
+                end_macro();
+                goto redo;
+            } else if (t == '\\') {
+                if (!(parse_flags & PARSE_FLAG_ACCEPT_STRAYS))
+                    tcc_error("stray '\\' in program");
+            }
+            return;
         }
-    } else if (tok >= TOK_IDENT && (parse_flags & PARSE_FLAG_PREPROCESS)) {
-        Sym *s;
+    } else if (t >= TOK_IDENT && (parse_flags & PARSE_FLAG_PREPROCESS)) {
         /* if reading from file, try to substitute macros */
-        s = define_find(tok);
+        Sym *s = define_find(t);
         if (s) {
             Sym *nested_list = NULL;
             tokstr_buf.len = 0;
@@ -3561,12 +3598,13 @@ ST_FUNC void next(void)
             begin_macro(&tokstr_buf, 0);
             goto redo;
         }
+        return;
     }
     /* convert preprocessor tokens into C tokens */
-    if (tok == TOK_PPNUM) {
+    if (t == TOK_PPNUM) {
         if  (parse_flags & PARSE_FLAG_TOK_NUM)
             parse_number((char *)tokc.str.data);
-    } else if (tok == TOK_PPSTR) {
+    } else if (t == TOK_PPSTR) {
         if (parse_flags & PARSE_FLAG_TOK_STR)
             parse_string((char *)tokc.str.data, tokc.str.size - 1);
     }
@@ -3584,8 +3622,116 @@ ST_INLN void unget_tok(int last_tok)
     tok = last_tok;
 }
 
-ST_FUNC void preprocess_start(TCCState *s1, int is_asm)
+static void tcc_predefs(CString *cstr)
 {
+    cstr_cat(cstr,
+
+    //"#include <tcc_predefs.h>\n"
+
+#if defined TCC_TARGET_X86_64
+#ifndef TCC_TARGET_PE
+    /* GCC compatible definition of va_list. */
+    /* This should be in sync with the declaration in our lib/libtcc1.c */
+    "typedef struct{\n"
+    "unsigned gp_offset,fp_offset;\n"
+    "union{\n"
+    "unsigned overflow_offset;\n"
+    "char*overflow_arg_area;\n"
+    "};\n"
+    "char*reg_save_area;\n"
+    "}__builtin_va_list[1];\n"
+    "void*__va_arg(__builtin_va_list ap,int arg_type,int size,int align);\n"
+    "#define __builtin_va_start(ap,last) (*(ap)=*(__builtin_va_list)((char*)__builtin_frame_address(0)-24))\n"
+    "#define __builtin_va_arg(ap,t) (*(t*)(__va_arg(ap,__builtin_va_arg_types(t),sizeof(t),__alignof__(t))))\n"
+    "#define __builtin_va_copy(dest,src) (*(dest)=*(src))\n"
+#else /* TCC_TARGET_PE */
+    "typedef char*__builtin_va_list;\n"
+    "#define __builtin_va_arg(ap,t) ((sizeof(t)>8||(sizeof(t)&(sizeof(t)-1)))?**(t**)((ap+=8)-8):*(t*)((ap+=8)-8))\n"
+#endif
+#elif defined TCC_TARGET_ARM
+    "typedef char*__builtin_va_list;\n"
+    "#define _tcc_alignof(type) ((int)&((struct{char c;type x;}*)0)->x)\n"
+    "#define _tcc_align(addr,type) (((unsigned)addr+_tcc_alignof(type)-1)&~(_tcc_alignof(type)-1))\n"
+    "#define __builtin_va_start(ap,last) (ap=((char*)&(last))+((sizeof(last)+3)&~3))\n"
+    "#define __builtin_va_arg(ap,type) (ap=(void*)((_tcc_align(ap,type)+sizeof(type)+3)&~3),*(type*)(ap-((sizeof(type)+3)&~3)))\n"
+#elif defined TCC_TARGET_ARM64
+    "typedef struct{\n"
+    "void*__stack,*__gr_top,*__vr_top;\n"
+    "int __gr_offs,__vr_offs;\n"
+    "}__builtin_va_list;\n"
+#elif defined TCC_TARGET_RISCV64
+    "typedef char*__builtin_va_list;\n"
+    "#define __va_reg_size (__riscv_xlen>>3)\n"
+    "#define _tcc_align(addr,type) (((unsigned long)addr+__alignof__(type)-1)&-(__alignof__(type)))\n"
+    "#define __builtin_va_arg(ap,type) (*(sizeof(type)>(2*__va_reg_size)?*(type**)((ap+=__va_reg_size)-__va_reg_size):(ap=(va_list)(_tcc_align(ap,type)+(sizeof(type)+__va_reg_size-1)&-__va_reg_size),(type*)(ap-((sizeof(type)+__va_reg_size-1)&-__va_reg_size)))))\n"
+#else /* TCC_TARGET_I386 */
+    "typedef char*__builtin_va_list;\n"
+    "#define __builtin_va_start(ap,last) (ap=((char*)&(last))+((sizeof(last)+3)&~3))\n"
+    "#define __builtin_va_arg(ap,t) (*(t*)((ap+=(sizeof(t)+3)&~3)-((sizeof(t)+3)&~3)))\n"
+#endif
+    "#define __builtin_va_end(ap) (void)(ap)\n"
+    "#ifndef __builtin_va_copy\n"
+    "#define __builtin_va_copy(dest,src) (dest)=(src)\n"
+    "#endif\n"
+    /* TCC BBUILTIN AND BOUNDS ALIASES */
+    "#ifdef __BOUNDS_CHECKING_ON\n"
+    "#define __BUILTINBC(ret,name,params) ret __builtin_##name params __attribute__((alias(\"__bound_\"#name)));\n"
+    "#define __BOUND(ret,name,params) ret name params __attribute__((alias(\"__bound_\"#name)));\n"
+    "#else\n"
+    "#define __BUILTINBC(ret,name,params) ret __builtin_##name params __attribute__((alias(#name)));\n"
+    "#define __BOUND(ret,name,params)\n"
+    "#endif\n"
+    "#define __BOTH(ret,name,params) __BUILTINBC(ret,name,params)__BOUND(ret,name,params)\n"
+    "#define __BUILTIN(ret,name,params) ret __builtin_##name params __attribute__((alias(\"\"#name)));\n"
+    "__BOTH(void*,memcpy,(void*,const void*,__SIZE_TYPE__))\n"
+    "__BOTH(void*,memmove,(void*,const void*,__SIZE_TYPE__))\n"
+    "__BOTH(void*,memset,(void*,int,__SIZE_TYPE__))\n"
+    "__BOTH(int,memcmp,(const void*,const void*,__SIZE_TYPE__))\n"
+    "__BOTH(__SIZE_TYPE__,strlen,(const char*))\n"
+    "__BOTH(char*,strcpy,(char*,const char*))\n"
+    "__BOTH(char*,strncpy,(char*,const char*,__SIZE_TYPE__))\n"
+    "__BOTH(int,strcmp,(const char*,const char*))\n"
+    "__BOTH(int,strncmp,(const char*,const char*,__SIZE_TYPE__))\n"
+    "__BOTH(char*,strcat,(char*,const char*))\n"
+    "__BOTH(char*,strchr,(const char*,int))\n"
+    "__BOTH(char*,strdup,(const char*))\n"
+#ifdef TCC_TARGET_PE
+    "#define __MAYBE_REDIR __BOTH\n"
+#else  // HAVE MALLOC_REDIR
+    "#define __MAYBE_REDIR __BUILTIN\n"
+#endif
+    "__MAYBE_REDIR(void*,malloc,(__SIZE_TYPE__))\n"
+    "__MAYBE_REDIR(void*,realloc,(void*,__SIZE_TYPE__))\n"
+    "__MAYBE_REDIR(void*,calloc,(__SIZE_TYPE__,__SIZE_TYPE__))\n"
+    "__MAYBE_REDIR(void*,memalign,(__SIZE_TYPE__,__SIZE_TYPE__))\n"
+    "__MAYBE_REDIR(void,free,(void*))\n"
+#if defined TCC_TARGET_I386 || defined TCC_TARGET_X86_64
+    "__BOTH(void*,alloca,(__SIZE_TYPE__))\n"
+#endif
+#if defined(TCC_TARGET_ARM) && defined(TCC_ARM_EABI)
+    "__BOUND(void*,__aeabi_memcpy,(void*,const void*,__SIZE_TYPE__))\n"
+    "__BOUND(void*,__aeabi_memmove,(void*,const void*,__SIZE_TYPE__))\n"
+    "__BOUND(void*,__aeabi_memmove4,(void*,const void*,__SIZE_TYPE__))\n"
+    "__BOUND(void*,__aeabi_memmove8,(void*,const void*,__SIZE_TYPE__))\n"
+    "__BOUND(void*,__aeabi_memset,(void*,int,__SIZE_TYPE__))\n"
+#endif
+    "__BUILTIN(void,abort,(void))\n"
+    "__BOUND(int,longjmp,())\n"
+#ifndef TCC_TARGET_PE
+    "__BOUND(void*,mmap,())\n"
+    "__BOUND(void*,munmap,())\n"
+#endif
+    "#undef __BUILTINBC\n"
+    "#undef __BUILTIN\n"
+    "#undef __BOUND\n"
+    "#undef __BOTH\n"
+    "#undef __MAYBE_REDIR\n"
+    , -1);
+}
+
+ST_FUNC void preprocess_start(TCCState *s1, int filetype)
+{
+    int is_asm = !!(filetype & (AFF_TYPE_ASM|AFF_TYPE_ASMPP));
     CString cstr;
 
     tccpp_new(s1);
@@ -3600,26 +3746,28 @@ ST_FUNC void preprocess_start(TCCState *s1, int is_asm)
     s1->pack_stack[0] = 0;
     s1->pack_stack_ptr = s1->pack_stack;
 
-    set_idnum('$', s1->dollars_in_identifiers ? IS_ID : 0);
+    set_idnum('$', !is_asm && s1->dollars_in_identifiers ? IS_ID : 0);
     set_idnum('.', is_asm ? IS_ID : 0);
 
-    cstr_new(&cstr);
-    if (s1->cmdline_defs.size)
-        cstr_cat(&cstr, s1->cmdline_defs.data, s1->cmdline_defs.size);
-    cstr_printf(&cstr, "#define __BASE_FILE__ \"%s\"\n", file->filename);
-    if (is_asm)
-        cstr_printf(&cstr, "#define __ASSEMBLER__ 1\n");
-    if (s1->output_type == TCC_OUTPUT_MEMORY)
-        cstr_printf(&cstr, "#define __TCC_RUN__ 1\n");
-    if (!is_asm && s1->output_type != TCC_OUTPUT_PREPROCESS)
-        cstr_cat(&cstr, "#include \"tcc_predefs.h\"\n", -1);
-    if (s1->cmdline_incl.size)
-        cstr_cat(&cstr, s1->cmdline_incl.data, s1->cmdline_incl.size);
-    //printf("%s\n", (char*)cstr.data);
-    *s1->include_stack_ptr++ = file;
-    tcc_open_bf(s1, "<command line>", cstr.size);
-    memcpy(file->buffer, cstr.data, cstr.size);
-    cstr_free(&cstr);
+    if (!(filetype & AFF_TYPE_ASM)) {
+        cstr_new(&cstr);
+        if (s1->cmdline_defs.size)
+          cstr_cat(&cstr, s1->cmdline_defs.data, s1->cmdline_defs.size);
+        cstr_printf(&cstr, "#define __BASE_FILE__ \"%s\"\n", file->filename);
+        if (is_asm)
+          cstr_printf(&cstr, "#define __ASSEMBLER__ 1\n");
+        if (s1->output_type == TCC_OUTPUT_MEMORY)
+          cstr_printf(&cstr, "#define __TCC_RUN__ 1\n");
+        if (!is_asm && s1->output_type != TCC_OUTPUT_PREPROCESS)
+          tcc_predefs(&cstr);
+        if (s1->cmdline_incl.size)
+          cstr_cat(&cstr, s1->cmdline_incl.data, s1->cmdline_incl.size);
+        //printf("%s\n", (char*)cstr.data);
+        *s1->include_stack_ptr++ = file;
+        tcc_open_bf(s1, "<command line>", cstr.size);
+        memcpy(file->buffer, cstr.data, cstr.size);
+        cstr_free(&cstr);
+    }
 
     parse_flags = is_asm ? PARSE_FLAG_ASM_FILE : 0;
     tok_flags = TOK_FLAG_BOL | TOK_FLAG_BOF;
@@ -3729,7 +3877,7 @@ static void tok_print(const char *msg, const int *str)
 	TOK_GET(&t, &str, &cval);
 	if (!t)
 	    break;
-	fprintf(fp, " %s" + s, get_tok_str(t, &cval)), s = 1;
+	fprintf(fp, &" %s"[s], get_tok_str(t, &cval)), s = 1;
     }
     fprintf(fp, "\n");
 }
@@ -3856,19 +4004,21 @@ ST_FUNC int tcc_preprocess(TCCState *s1)
     if (s1->Pflag == LINE_MACRO_OUTPUT_FORMAT_P10)
         parse_flags |= PARSE_FLAG_TOK_NUM, s1->Pflag = 1;
 
-#ifdef PP_BENCH
-    /* for PP benchmarks */
-    do next(); while (tok != TOK_EOF);
-    return 0;
-#endif
+    if (s1->do_bench) {
+	/* for PP benchmarks */
+	do next(); while (tok != TOK_EOF);
+	return 0;
+    }
 
     if (s1->dflag & 1) {
         pp_debug_builtins(s1);
         s1->dflag &= ~1;
     }
 
-    token_seen = TOK_LINEFEED, spcs = 0;
-    pp_line(s1, file, 0);
+    token_seen = TOK_LINEFEED, spcs = 0, level = 0;
+    if (file->prev)
+        pp_line(s1, file->prev, level++);
+    pp_line(s1, file, level);
     for (;;) {
         iptr = s1->include_stack_ptr;
         next();

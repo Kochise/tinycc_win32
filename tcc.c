@@ -48,6 +48,7 @@ static const char help[] =
     "  -Dsym[=val]  define 'sym' with value 'val'\n"
     "  -Usym        undefine 'sym'\n"
     "  -E           preprocess only\n"
+    "  -C           keep comments (not yet implemented)\n"
     "Linker options:\n"
     "  -Ldir        add library path 'dir'\n"
     "  -llib        link with dynamic or static library 'lib'\n"
@@ -268,10 +269,16 @@ redo:
     opt = tcc_parse_args(s, &argc, &argv, 1);
 
     if (n == 0) {
-        if (opt == OPT_HELP)
-            return fputs(help, stdout), 0;
-        if (opt == OPT_HELP2)
-            return fputs(help2, stdout), 0;
+        if (opt == OPT_HELP) {
+            fputs(help, stdout);
+            if (!s->verbose)
+                return 0;
+            ++opt;
+        }
+        if (opt == OPT_HELP2) {
+            fputs(help2, stdout);
+            return 0;
+        }
         if (opt == OPT_M32 || opt == OPT_M64)
             tcc_tool_cross(s, argv, opt); /* never returns */
         if (s->verbose)
@@ -306,9 +313,6 @@ redo:
                 tcc_error("cannot specify libraries with -c");
             if (s->nb_files > 1 && s->outfile)
                 tcc_error("cannot specify output file with -c many files");
-        } else {
-            if (s->option_pthread)
-                tcc_set_options(s, "-lpthread");
         }
 
         if (s->do_bench)

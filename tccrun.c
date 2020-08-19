@@ -124,24 +124,30 @@ ST_FUNC void tcc_run_free(TCCState *s1)
     tcc_free(s1->runtime_mem);
 }
 
-static void run_cdtors(TCCState *s1, const char *start, const char *end)
+static void run_cdtors(TCCState *s1, const char *start, const char *end,
+                       int argc, char **argv, char **envp)
 {
-    void **a = tcc_get_symbol(s1, start);
-    void **b = tcc_get_symbol(s1, end);
+    void **a = (void **)get_sym_addr(s1, start, 0, 0);
+    void **b = (void **)get_sym_addr(s1, end, 0, 0);
     while (a != b)
-        ((void(*)(void))*a++)();
+        ((void(*)(int, char **, char **))*a++)(argc, argv, envp);
 }
 
 /* launch the compiled program with the given arguments */
 LIBTCCAPI int tcc_run(TCCState *s1, int argc, char **argv)
 {
-    int (*prog_main)(int, char **), ret;
+    int (*prog_main)(int, char **, char **), ret;
 #ifdef CONFIG_TCC_BACKTRACE
     rt_context *rc = &g_rtctxt;
 #endif
+# if defined(__APPLE__)
+    char **envp = NULL;
+#else
+    char **envp = environ;
+#endif
 
     s1->runtime_main = s1->nostdlib ? "_start" : "main";
-    if ((s1->dflag & 16) && !find_elf_sym(s1->symtab, s1->runtime_main))
+    if ((s1->dflag & 16) && (addr_t)-1 == get_sym_addr(s1, s1->runtime_main, 0, 1))
         return 0;
 #ifdef CONFIG_TCC_BACKTRACE
     if (s1->do_debug)
@@ -149,7 +155,7 @@ LIBTCCAPI int tcc_run(TCCState *s1, int argc, char **argv)
 #endif
     if (tcc_relocate(s1, TCC_RELOCATE_AUTO) < 0)
         return -1;
-    prog_main = tcc_get_symbol_err(s1, s1->runtime_main);
+    prog_main = (void*)get_sym_addr(s1, s1->runtime_main, 1, 1);
 
 #ifdef CONFIG_TCC_BACKTRACE
     memset(rc, 0, sizeof *rc);
@@ -172,7 +178,7 @@ LIBTCCAPI int tcc_run(TCCState *s1, int argc, char **argv)
 #ifdef CONFIG_TCC_BCHECK
         if (s1->do_bounds_check) {
             if ((p = tcc_get_symbol(s1, "__bound_init")))
-                ((void(*)(void*))p)(bounds_section->data);
+                ((void(*)(void*, int))p)(bounds_section->data, 1);
         }
 #endif
         set_exception_handler();
@@ -182,14 +188,15 @@ LIBTCCAPI int tcc_run(TCCState *s1, int argc, char **argv)
     errno = 0; /* clean errno value */
     fflush(stdout);
     fflush(stderr);
-    run_cdtors(s1, "__init_array_start", "__init_array_end");
+    /* These aren't C symbols, so don't need leading underscore handling.  */
+    run_cdtors(s1, "__init_array_start", "__init_array_end", argc, argv, envp);
 #ifdef CONFIG_TCC_BACKTRACE
     if (!rc->do_jmp || !(ret = setjmp(rc->jmp_buf)))
 #endif
     {
-        ret = prog_main(argc, argv);
+        ret = prog_main(argc, argv, envp);
     }
-    run_cdtors(s1, "__fini_array_start", "__fini_array_end");
+    run_cdtors(s1, "__fini_array_start", "__fini_array_end", 0, NULL, NULL);
     if ((s1->dflag & 16) && ret)
         fprintf(s1->ppfp, "[returns %d]\n", ret), fflush(s1->ppfp);
     return ret;
@@ -271,7 +278,7 @@ static int tcc_relocate_ex(TCCState *s1, void *ptr, addr_t ptr_diff)
         if (s->reloc)
             relocate_section(s1, s);
     }
-#ifndef TCC_TARGET_PE
+#if !defined(TCC_TARGET_PE) || defined(TCC_TARGET_MACHO)
     relocate_plt(s1);
 #endif
 
@@ -648,10 +655,12 @@ static void rt_getcontext(ucontext_t *uc, rt_context *rc)
 #elif defined(__arm__)
     rc->ip = uc->uc_mcontext.arm_pc;
     rc->fp = uc->uc_mcontext.arm_fp;
-    rc->sp = uc->uc_mcontext.arm_sp;
 #elif defined(__aarch64__)
     rc->ip = uc->uc_mcontext.pc;
     rc->fp = uc->uc_mcontext.regs[29];
+#elif defined(__riscv)
+    rc->ip = uc->uc_mcontext.__gregs[REG_PC];
+    rc->fp = uc->uc_mcontext.__gregs[REG_S0];
 #endif
 }
 
@@ -805,22 +814,9 @@ static int rt_get_caller_pc(addr_t *paddr, rt_context *rc, int level)
         *paddr = rc->ip;
     } else {
         addr_t fp = rc->fp;
-        addr_t sp = rc->sp;
-        if (sp < 0x1000)
-            sp = 0x1000;
-        /* XXX: specific to tinycc stack frames */
-        if (fp < sp + 12 || fp & 3)
-            return -1;
-        while (--level) {
-            sp = ((addr_t *)fp)[-2];
-            if (sp < fp || sp - fp > 16 || sp & 3)
-                return -1;
-            fp = ((addr_t *)fp)[-3];
-            if (fp <= sp || fp - sp < 12 || fp & 3)
-                return -1;
-        }
-        /* XXX: check address validity with program info */
-        *paddr = ((addr_t *)fp)[-1];
+        while (--level)
+            fp = ((addr_t *)fp)[0];
+        *paddr = ((addr_t *)fp)[2];
     }
     return 0;
 #endif
@@ -829,13 +825,29 @@ static int rt_get_caller_pc(addr_t *paddr, rt_context *rc, int level)
 #elif defined(__aarch64__)
 static int rt_get_caller_pc(addr_t *paddr, rt_context *rc, int level)
 {
-   if (level == 0) {
+    if (level == 0) {
         *paddr = rc->ip;
     } else {
         addr_t *fp = (addr_t*)rc->fp;
         while (--level)
             fp = (addr_t *)fp[0];
         *paddr = fp[1];
+    }
+    return 0;
+}
+
+#elif defined(__riscv)
+static int rt_get_caller_pc(addr_t *paddr, rt_context *rc, int level)
+{
+    if (level == 0) {
+        *paddr = rc->ip;
+    } else {
+        addr_t *fp = (addr_t*)rc->fp;
+        while (--level && fp >= (addr_t*)0x1000)
+            fp = (addr_t *)fp[-2];
+        if (fp < (addr_t*)0x1000)
+          return -1;
+        *paddr = fp[-1];
     }
     return 0;
 }

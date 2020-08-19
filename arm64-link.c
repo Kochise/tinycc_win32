@@ -37,6 +37,7 @@ int code_reloc (int reloc_type)
         case R_AARCH64_ADD_ABS_LO12_NC:
         case R_AARCH64_ADR_GOT_PAGE:
         case R_AARCH64_LD64_GOT_LO12_NC:
+        case R_AARCH64_LDST64_ABS_LO12_NC:
         case R_AARCH64_GLOB_DAT:
         case R_AARCH64_COPY:
             return 0;
@@ -62,6 +63,7 @@ int gotplt_entry_type (int reloc_type)
         case R_AARCH64_MOVW_UABS_G3:
         case R_AARCH64_ADR_PREL_PG_HI21:
         case R_AARCH64_ADD_ABS_LO12_NC:
+        case R_AARCH64_LDST64_ABS_LO12_NC:
         case R_AARCH64_GLOB_DAT:
         case R_AARCH64_JUMP_SLOT:
         case R_AARCH64_COPY:
@@ -85,9 +87,6 @@ ST_FUNC unsigned create_plt_entry(TCCState *s1, unsigned got_offset, struct sym_
     Section *plt = s1->plt;
     uint8_t *p;
     unsigned plt_offset;
-
-    if (s1->output_type == TCC_OUTPUT_DLL)
-        tcc_error("DLLs unimplemented!");
 
     if (plt->data_offset == 0) {
         section_ptr_add(plt, 32);
@@ -150,19 +149,54 @@ ST_FUNC void relocate_plt(TCCState *s1)
 
 void relocate(TCCState *s1, ElfW_Rel *rel, int type, unsigned char *ptr, addr_t addr, addr_t val)
 {
-    int sym_index = ELFW(R_SYM)(rel->r_info);
+    int sym_index = ELFW(R_SYM)(rel->r_info), esym_index;
 #ifdef DEBUG_RELOC
     ElfW(Sym) *sym = &((ElfW(Sym) *)symtab_section->data)[sym_index];
 #endif
 
     switch(type) {
         case R_AARCH64_ABS64:
-            write64le(ptr, val);
+            if (s1->output_type == TCC_OUTPUT_DLL) {
+                esym_index = get_sym_attr(s1, sym_index, 0)->dyn_index;
+                qrel->r_offset = rel->r_offset;
+                if (esym_index) {
+                    qrel->r_info = ELFW(R_INFO)(esym_index, R_AARCH64_ABS64);
+                    qrel->r_addend = rel->r_addend;
+                    qrel++;
+                    break;
+                } else {
+                    qrel->r_info = ELFW(R_INFO)(0, R_AARCH64_RELATIVE);
+                    qrel->r_addend = read64le(ptr) + val;
+                    qrel++;
+                }
+            }
+            add64le(ptr, val);
             return;
         case R_AARCH64_ABS32:
-            write32le(ptr, val);
+            if (s1->output_type == TCC_OUTPUT_DLL) {
+                /* XXX: this logic may depend on TCC's codegen
+                   now TCC uses R_AARCH64_RELATIVE even for a 64bit pointer */
+                qrel->r_offset = rel->r_offset;
+                qrel->r_info = ELFW(R_INFO)(0, R_AARCH64_RELATIVE);
+                /* Use sign extension! */
+                qrel->r_addend = (int)read32le(ptr) + val;
+                qrel++;
+            }
+            add32le(ptr, val);
             return;
 	case R_AARCH64_PREL32:
+            if (s1->output_type == TCC_OUTPUT_DLL) {
+                /* DLL relocation */
+                esym_index = get_sym_attr(s1, sym_index, 0)->dyn_index;
+                if (esym_index) {
+                    qrel->r_offset = rel->r_offset;
+                    qrel->r_info = ELFW(R_INFO)(esym_index, R_AARCH64_PREL32);
+                    /* Use sign extension! */
+                    qrel->r_addend = (int)read32le(ptr) + rel->r_addend;
+                    qrel++;
+                    break;
+                }
+            }
 	    write32le(ptr, val - addr);
 	    return;
         case R_AARCH64_MOVW_UABS_G0_NC:
@@ -192,6 +226,10 @@ void relocate(TCCState *s1, ElfW_Rel *rel, int type, unsigned char *ptr, addr_t 
         case R_AARCH64_ADD_ABS_LO12_NC:
             write32le(ptr, ((read32le(ptr) & 0xffc003ff) |
                             (val & 0xfff) << 10));
+            return;
+        case R_AARCH64_LDST64_ABS_LO12_NC:
+            write32le(ptr, ((read32le(ptr) & 0xffc003ff) |
+                            (val & 0xff8) << 7));
             return;
         case R_AARCH64_JUMP26:
         case R_AARCH64_CALL26:

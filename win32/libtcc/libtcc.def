@@ -16,6 +16,7 @@ tcc_compile_string
 tcc_define_symbol
 tcc_delete
 tcc_enter_state
+tcc_exit_state
 tcc_fileextension
 tcc_free
 tcc_get_dllexports

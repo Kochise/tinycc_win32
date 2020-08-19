@@ -21,17 +21,20 @@
 #include <stdio.h>
 #include <stdarg.h>
 #include <string.h>
+#include <setjmp.h>
 
 #if !defined(__FreeBSD__) \
  && !defined(__FreeBSD_kernel__) \
  && !defined(__DragonFly__) \
  && !defined(__OpenBSD__) \
+ && !defined(__APPLE__) \
  && !defined(__NetBSD__)
 #include <malloc.h>
 #endif
 
 #if !defined(_WIN32)
 #include <unistd.h>
+#include <sys/syscall.h>
 #endif
 
 #define BOUND_DEBUG             (1)
@@ -67,7 +70,6 @@
 #define WAIT_SEM()
 #define POST_SEM()
 #define HAVE_MEMALIGN          (0)
-#define HAS_ENVIRON            (0)
 #define MALLOC_REDIR           (0)
 #define HAVE_PTHREAD_CREATE    (0)
 #define HAVE_CTYPE             (0)
@@ -82,7 +84,6 @@ static CRITICAL_SECTION bounds_sem;
 #define WAIT_SEM()             EnterCriticalSection(&bounds_sem)
 #define POST_SEM()             LeaveCriticalSection(&bounds_sem)
 #define HAVE_MEMALIGN          (0)
-#define HAS_ENVIRON            (0)
 #define MALLOC_REDIR           (0)
 #define HAVE_PTHREAD_CREATE    (0)
 #define HAVE_CTYPE             (0)
@@ -96,7 +97,14 @@ static CRITICAL_SECTION bounds_sem;
 #include <pthread.h>
 #include <dlfcn.h>
 #include <errno.h>
-#if 0
+#ifdef __APPLE__
+#include <dispatch/dispatch.h>
+static dispatch_semaphore_t bounds_sem;
+#define INIT_SEM()             bounds_sem = dispatch_semaphore_create(1)
+#define EXIT_SEM()             dispatch_release(*(dispatch_object_t*)&bounds_sem)
+#define WAIT_SEM()             if (use_sem) dispatch_semaphore_wait(bounds_sem, DISPATCH_TIME_FOREVER)
+#define POST_SEM()             if (use_sem) dispatch_semaphore_signal(bounds_sem)
+#elif 0
 #include <semaphore.h>
 static sem_t bounds_sem;
 #define INIT_SEM()             sem_init (&bounds_sem, 0, 1)
@@ -104,6 +112,12 @@ static sem_t bounds_sem;
 #define WAIT_SEM()             if (use_sem) while (sem_wait (&bounds_sem) < 0 \
                                                    && errno == EINTR)
 #define POST_SEM()             if (use_sem) sem_post (&bounds_sem)
+#elif 0
+static pthread_mutex_t bounds_mtx;
+#define INIT_SEM()             pthread_mutex_init (&bounds_mtx, NULL)
+#define EXIT_SEM()             pthread_mutex_destroy (&bounds_mtx)
+#define WAIT_SEM()             if (use_sem) pthread_mutex_lock (&bounds_mtx)
+#define POST_SEM()             if (use_sem) pthread_mutex_unlock (&bounds_mtx)
 #else
 static pthread_spinlock_t bounds_spin;
 /* about 25% faster then semaphore. */
@@ -113,7 +127,6 @@ static pthread_spinlock_t bounds_spin;
 #define POST_SEM()             if (use_sem) pthread_spin_unlock (&bounds_spin)
 #endif
 #define HAVE_MEMALIGN          (1)
-#define HAS_ENVIRON            (1)
 #define MALLOC_REDIR           (1)
 #define HAVE_PTHREAD_CREATE    (1)
 #define HAVE_CTYPE             (1)
@@ -158,6 +171,25 @@ typedef struct alloca_list_struct {
     struct alloca_list_struct *next;
 } alloca_list_type;
 
+#if defined(_WIN32)
+#define BOUND_TID_TYPE   DWORD
+#define BOUND_GET_TID    GetCurrentThreadId()
+#elif defined(__i386__) || defined(__x86_64__) || defined(__arm__) || defined(__aarch64__) || defined(__riscv)
+#define BOUND_TID_TYPE   pid_t
+#define BOUND_GET_TID    syscall (SYS_gettid)
+#else
+#define BOUND_TID_TYPE   int
+#define BOUND_GET_TID    0
+#endif
+
+typedef struct jmp_list_struct {
+    void *penv;
+    size_t fp;
+    size_t end_fp;
+    BOUND_TID_TYPE tid;
+    struct jmp_list_struct *next;
+} jmp_list_type;
+
 #define BOUND_STATISTIC_SPLAY   (0)
 static Tree * splay (size_t addr, Tree *t);
 static Tree * splay_end (size_t addr, Tree *t);
@@ -177,15 +209,18 @@ DLL_EXPORT void * __bound_ptr_indir12(void *p, size_t offset);
 DLL_EXPORT void * __bound_ptr_indir16(void *p, size_t offset);
 DLL_EXPORT void FASTCALL __bound_local_new(void *p1);
 DLL_EXPORT void FASTCALL __bound_local_delete(void *p1);
-void __bound_init(size_t *);
-void __bound_main_arg(char **p);
+void __bound_init(size_t *, int);
+void __bound_main_arg(int argc, char **argv, char **envp);
 void __bound_exit(void);
 #if !defined(_WIN32)
 void *__bound_mmap (void *start, size_t size, int prot, int flags, int fd,
                     off_t offset);
 int __bound_munmap (void *start, size_t size);
+DLL_EXPORT void __bound_siglongjmp(jmp_buf env, int val);
 #endif
 DLL_EXPORT void __bound_new_region(void *p, size_t size);
+DLL_EXPORT void __bound_setjmp(jmp_buf env);
+DLL_EXPORT void __bound_longjmp(jmp_buf env, int val);
 DLL_EXPORT void *__bound_memcpy(void *dst, const void *src, size_t size);
 DLL_EXPORT int __bound_memcmp(const void *s1, const void *s2, size_t size);
 DLL_EXPORT void *__bound_memmove(void *dst, const void *src, size_t size);
@@ -199,7 +234,31 @@ DLL_EXPORT char *__bound_strcat(char *dest, const char *src);
 DLL_EXPORT char *__bound_strchr(const char *string, int ch);
 DLL_EXPORT char *__bound_strdup(const char *s);
 
-#if !MALLOC_REDIR
+#if defined(__arm__)
+DLL_EXPORT void *__bound___aeabi_memcpy(void *dst, const void *src, size_t size);
+DLL_EXPORT void *__bound___aeabi_memmove(void *dst, const void *src, size_t size);
+DLL_EXPORT void *__bound___aeabi_memmove4(void *dst, const void *src, size_t size);
+DLL_EXPORT void *__bound___aeabi_memmove8(void *dst, const void *src, size_t size);
+DLL_EXPORT void *__bound___aeabi_memset(void *dst, int c, size_t size);
+DLL_EXPORT void *__aeabi_memcpy(void *dst, const void *src, size_t size);
+DLL_EXPORT void *__aeabi_memmove(void *dst, const void *src, size_t size);
+DLL_EXPORT void *__aeabi_memmove4(void *dst, const void *src, size_t size);
+DLL_EXPORT void *__aeabi_memmove8(void *dst, const void *src, size_t size);
+DLL_EXPORT void *__aeabi_memset(void *dst, int c, size_t size);
+#endif
+
+#if MALLOC_REDIR
+#define BOUND_MALLOC(a)          malloc_redir(a)
+#define BOUND_MEMALIGN(a,b)      memalign_redir(a,b)
+#define BOUND_FREE(a)            free_redir(a)
+#define BOUND_REALLOC(a,b)       realloc_redir(a,b)
+#define BOUND_CALLOC(a,b)        calloc_redir(a,b)
+#else
+#define BOUND_MALLOC(a)          malloc(a)
+#define BOUND_MEMALIGN(a,b)      memalign(a,b)
+#define BOUND_FREE(a)            free(a)
+#define BOUND_REALLOC(a,b)       realloc(a,b)
+#define BOUND_CALLOC(a,b)        calloc(a,b)
 DLL_EXPORT void *__bound_malloc(size_t size, const void *caller);
 DLL_EXPORT void *__bound_memalign(size_t size, size_t align, const void *caller);
 DLL_EXPORT void __bound_free(void *ptr, const void *caller);
@@ -217,6 +276,7 @@ static Tree *tree = NULL;
 static Tree *tree_free_list;
 #endif
 static alloca_list_type *alloca_list;
+static jmp_list_type *jmp_list;
 
 static unsigned char inited;
 static unsigned char print_warn_ptr_add;
@@ -224,8 +284,8 @@ static unsigned char print_calls;
 static unsigned char print_heap;
 static unsigned char print_statistic;
 static unsigned char no_strdup;
-static signed char never_fatal;
-static signed char no_checking = 1;
+static int never_fatal;
+static int no_checking = 1;
 static char exec[100];
 
 #if BOUND_STATISTIC
@@ -246,6 +306,8 @@ static unsigned long long bound_memalign_count;
 static unsigned long long bound_mmap_count;
 static unsigned long long bound_munmap_count;
 static unsigned long long bound_alloca_count;
+static unsigned long long bound_setjmp_count;
+static unsigned long long bound_longjmp_count;
 static unsigned long long bound_mempcy_count;
 static unsigned long long bound_memcmp_count;
 static unsigned long long bound_memmove_count;
@@ -274,14 +336,23 @@ static unsigned long long bound_splay_delete;
 #endif
 
 /* currently only i386/x86_64 supported. Change for other platforms */
-static void fetch_and_add(signed char* variable, signed char value)
+static void fetch_and_add(int* variable, int value)
 {
 #if defined __i386__ || defined __x86_64__
-      __asm__ volatile("lock; addb %0, %1"
+      __asm__ volatile("lock; addl %0, %1"
         : "+r" (value), "+m" (*variable) // input+output
         : // No input-only
         : "memory"
       );
+#elif defined __arm__
+      extern void fetch_and_add_arm(int* variable, int value);
+      fetch_and_add_arm(variable, value);
+#elif defined __aarch64__
+      extern void fetch_and_add_arm64(int* variable, int value);
+      fetch_and_add_arm64(variable, value);
+#elif defined __riscv
+      extern void fetch_and_add_riscv64(int* variable, int value);
+      fetch_and_add_riscv64(variable, value);
 #else
       *variable += value;
 #endif
@@ -473,7 +544,6 @@ void FASTCALL __bound_local_new(void *p1)
 void FASTCALL __bound_local_delete(void *p1) 
 {
     size_t addr, fp, *p = p1;
-    alloca_list_type *free_list = NULL;
 
     if (no_checking)
          return;
@@ -486,41 +556,51 @@ void FASTCALL __bound_local_delete(void *p1)
         tree = splay_delete(addr + fp, tree);
         p += 2;
     }
-    {
-            alloca_list_type *last = NULL;
-            alloca_list_type *cur = alloca_list;
+    if (alloca_list) {
+        alloca_list_type *last = NULL;
+        alloca_list_type *cur = alloca_list;
 
-            while (cur) {
-                if (cur->fp == fp) {
-                    if (last)
-                        last->next = cur->next;
-                    else
-                        alloca_list = cur->next;
-                    tree = splay_delete ((size_t) cur->p, tree);
-                    cur->next = free_list;
-                    free_list = cur;
-                    cur = last ? last->next : alloca_list;
-                 }
-                 else {
-                     last = cur;
-                     cur = cur->next;
-                 }
+        do {
+            if (cur->fp == fp) {
+                if (last)
+                    last->next = cur->next;
+                else
+                    alloca_list = cur->next;
+                tree = splay_delete ((size_t) cur->p, tree);
+                dprintf(stderr, "%s, %s(): remove alloca/vla %p\n",
+                        __FILE__, __FUNCTION__, cur->p);
+                BOUND_FREE (cur);
+                cur = last ? last->next : alloca_list;
+             }
+             else {
+                 last = cur;
+                 cur = cur->next;
+             }
+        } while (cur);
+    }
+    if (jmp_list) {
+        jmp_list_type *last = NULL;
+        jmp_list_type *cur = jmp_list;
+
+        do {
+            if (cur->fp == fp) {
+                if (last)
+                    last->next = cur->next;
+                else
+                    jmp_list = cur->next;
+                dprintf(stderr, "%s, %s(): remove setjmp %p\n",
+                       __FILE__, __FUNCTION__, cur->penv);
+                BOUND_FREE (cur);
+                cur = last ? last->next : jmp_list;
             }
+            else {
+                last = cur;
+                cur = cur->next;
+            }
+        } while (cur);
     }
 
     POST_SEM ();
-    while (free_list) {
-        alloca_list_type *next = free_list->next;
-
-        dprintf(stderr, "%s, %s(): remove alloca/vla %p\n",
-               __FILE__, __FUNCTION__, free_list->p);
-#if MALLOC_REDIR
-        free_redir (free_list);
-#else
-        free (free_list);
-#endif
-        free_list = next;
-    }
 #if BOUND_DEBUG
     if (print_calls) {
         p = p1;
@@ -544,14 +624,13 @@ void __bound_new_region(void *p, size_t size)
     alloca_list_type *cur;
     alloca_list_type *new;
 
+    if (no_checking)
+        return;
+
     dprintf(stderr, "%s, %s(): %p, 0x%lx\n",
             __FILE__, __FUNCTION__, p, (unsigned long)size);
     GET_CALLER_FP (fp);
-#if MALLOC_REDIR
-    new = malloc_redir (sizeof (alloca_list_type));
-#else
-    new = malloc (sizeof (alloca_list_type));
-#endif
+    new = BOUND_MALLOC (sizeof (alloca_list_type));
     WAIT_SEM ();
     INCR_COUNT(bound_alloca_count);
     last = NULL;
@@ -568,8 +647,7 @@ void __bound_new_region(void *p, size_t size)
         last = cur;
         cur = cur->next;
     }
-    if (no_checking == 0)
-        tree = splay_insert((size_t)p, size, tree);
+    tree = splay_insert((size_t)p, size, tree);
     if (new) {
         new->fp = fp;
         new->p = p;
@@ -580,21 +658,145 @@ void __bound_new_region(void *p, size_t size)
     if (cur) {
         dprintf(stderr, "%s, %s(): remove alloca/vla %p\n",
                 __FILE__, __FUNCTION__, cur->p);
-#if MALLOC_REDIR
-        free_redir (cur);
-#else
-        free (cur);
-#endif
+        BOUND_FREE (cur);
     }
 }
+
+void __bound_setjmp(jmp_buf env)
+{
+    jmp_list_type *jl;
+    void *e = (void *) env;
+
+    if (no_checking == 0) {
+        dprintf(stderr, "%s, %s(): %p\n", __FILE__, __FUNCTION__, e);
+        WAIT_SEM ();
+        INCR_COUNT(bound_setjmp_count);
+        jl = jmp_list;
+        while (jl) {
+            if (jl->penv == e)
+                break;
+            jl = jl->next;
+        }
+        if (jl == NULL) {
+            jl = BOUND_MALLOC (sizeof (jmp_list_type));
+            if (jl) {
+                jl->penv = e;
+                jl->next = jmp_list;
+                jmp_list = jl;
+            }
+        }
+        if (jl) {
+            size_t fp;
+
+            GET_CALLER_FP (fp);
+            jl->fp = fp;
+            jl->end_fp = (size_t)__builtin_frame_address(0);
+            jl->tid = BOUND_GET_TID;
+        }
+        POST_SEM ();
+    }
+}
+
+static void __bound_long_jump(jmp_buf env, int val, int sig, const char *func)
+{
+    jmp_list_type *jl;
+    void *e;
+    BOUND_TID_TYPE tid;
+
+    if (no_checking == 0) {
+        e = (void *)env;
+        tid = BOUND_GET_TID;
+        dprintf(stderr, "%s, %s(): %p\n", __FILE__, func, e);
+        WAIT_SEM();
+        INCR_COUNT(bound_longjmp_count);
+        jl = jmp_list;
+        while (jl) {
+            if (jl->penv == e && jl->tid == tid) {
+                size_t start_fp = (size_t)__builtin_frame_address(0);
+                size_t end_fp = jl->end_fp;
+                jmp_list_type *cur = jmp_list;
+                jmp_list_type *last = NULL;
+
+                while (cur->penv != e || cur->tid != tid) {
+                    if (cur->tid == tid) {
+                        dprintf(stderr, "%s, %s(): remove setjmp %p\n",
+                                __FILE__, func, cur->penv);
+                        if (last)
+                            last->next = cur->next;
+                        else
+                            jmp_list = cur->next;
+                        BOUND_FREE (cur);
+                        cur = last ? last->next : jmp_list;
+                    }
+                    else {
+                        last = cur;
+                        cur = cur->next;
+                    }
+                }
+                for (;;) {
+                    Tree *t = tree;
+                    alloca_list_type *last;
+                    alloca_list_type *cur;
+
+                    while (t && (t->start < start_fp || t->start > end_fp))
+                        if (t->start < start_fp)
+                            t = t->right;
+                        else
+                            t = t->left;
+                    if (t == NULL)
+                        break;
+                    last = NULL;
+                    cur = alloca_list;
+                    while (cur) {
+                         if ((size_t) cur->p == t->start) {
+                             dprintf(stderr, "%s, %s(): remove alloca/vla %p\n",
+                                     __FILE__, func, cur->p);
+                             if (last)
+                                 last->next = cur->next;
+                             else
+                                 alloca_list = cur->next;
+                             BOUND_FREE (cur);
+                             break;
+                         }
+                         last = cur;
+                         cur = cur->next;
+                    }
+                    dprintf(stderr, "%s, %s(): delete %p\n",
+                            __FILE__, func, (void *) t->start);
+                    tree = splay_delete(t->start, tree);
+                }
+                break;
+            }
+            jl = jl->next;
+        }
+        POST_SEM();
+    }
+#if !defined(_WIN32)
+    sig ? siglongjmp(env, val) :
+#endif
+    longjmp (env, val);
+}
+
+void __bound_longjmp(jmp_buf env, int val)
+{
+    __bound_long_jump(env,val, 0, __FUNCTION__);
+}
+
+#if !defined(_WIN32)
+void __bound_siglongjmp(jmp_buf env, int val)
+{
+    __bound_long_jump(env,val, 1, __FUNCTION__);
+}
+#endif
 
 #if defined(__GNUC__) && (__GNUC__ >= 6)
 #pragma GCC diagnostic pop
 #endif
 
-void __bound_init(size_t *p)
+void __bound_init(size_t *p, int mode)
 {
-    dprintf(stderr, "%s, %s(): start\n", __FILE__, __FUNCTION__);
+    dprintf(stderr, "%s, %s(): start %s\n", __FILE__, __FUNCTION__,
+            mode < 0 ? "lazy" : mode == 0 ? "normal use" : "for -run");
 
     if (inited) {
         WAIT_SEM();
@@ -612,9 +814,12 @@ void __bound_init(size_t *p)
 
 #if MALLOC_REDIR
     {
-        void *addr = RTLD_NEXT;
+        void *addr = mode > 0 ? RTLD_DEFAULT : RTLD_NEXT;
 
-        /* tcc -run required RTLD_DEFAULT. Normal usage requires RTLD_NEXT */
+        /* tcc -run required RTLD_DEFAULT. Normal usage requires RTLD_NEXT,
+           but using RTLD_NEXT with -run segfaults on MacOS in dyld as the
+           generated code segment isn't registered with dyld and hence the
+           caller image of dlsym isn't known to it */
         *(void **) (&malloc_redir) = dlsym (addr, "malloc");
         if (malloc_redir == NULL) {
             dprintf(stderr, "%s, %s(): use RTLD_DEFAULT\n",
@@ -648,10 +853,10 @@ void __bound_init(size_t *p)
     {
         FILE *fp;
         unsigned char found;
-        unsigned long long start;
-        unsigned long long end;
-        unsigned long long ad =
-            (unsigned long long) __builtin_return_address(0);
+        unsigned long start;
+        unsigned long end;
+        unsigned long ad =
+            (unsigned long) __builtin_return_address(0);
         char line[1000];
 
         /* Display exec name. Usefull when a lot of code is compiled with tcc */
@@ -669,7 +874,7 @@ void __bound_init(size_t *p)
         fp = fopen ("/proc/self/maps", "r");
         if (fp) {
             while (fgets (line, sizeof(line), fp)) {
-                if (sscanf (line, "%Lx-%Lx", &start, &end) == 2 &&
+                if (sscanf (line, "%lx-%lx", &start, &end) == 2 &&
                             ad >= start && ad < end) {
                     found = 1;
                     break;
@@ -689,6 +894,10 @@ void __bound_init(size_t *p)
     WAIT_SEM ();
 
 #if HAVE_CTYPE
+#ifdef __APPLE__
+    tree = splay_insert((size_t) &_DefaultRuneLocale,
+                        sizeof (_DefaultRuneLocale), tree);
+#else
     /* XXX: Does not work if locale is changed */
     tree = splay_insert((size_t) __ctype_b_loc(),
                         sizeof (unsigned short *), tree);
@@ -702,6 +911,7 @@ void __bound_init(size_t *p)
                         sizeof (__int32_t *), tree);
     tree = splay_insert((size_t) (*__ctype_toupper_loc() - 128),
                         384 * sizeof (__int32_t), tree);
+#endif
 #endif
 #if HAVE_ERRNO
     tree = splay_insert((size_t) (&errno), sizeof (int), tree);
@@ -730,61 +940,57 @@ no_bounds:
     dprintf(stderr, "%s, %s(): end\n\n", __FILE__, __FUNCTION__);
 }
 
-void __bound_main_arg(char **p)
-{
-    char *start = (char *) p;
-
-    WAIT_SEM ();
-    while (*p) {
-        tree = splay_insert((size_t) *p, strlen (*p) + 1, tree);
-        ++p;
-    }
-    tree = splay_insert((size_t) start, (char *) p - start, tree);
-    POST_SEM ();
-#if BOUND_DEBUG
-    if (print_calls) {
-        p = (char **) start;
-        while (*p) {
-            dprintf(stderr, "%s, %s(): %p 0x%lx\n",
-                    __FILE__, __FUNCTION__,
-                    *p, (unsigned long)(strlen (*p) + 1));
-            ++p;
-        }
-        dprintf(stderr, "%s, %s(): argv %p 0x%lx\n",
-                __FILE__, __FUNCTION__,
-                start, (unsigned long)((char *) p - start));
-    }
+void
+#if (defined(__GLIBC__) && (__GLIBC_MINOR__ >= 4)) || defined(_WIN32)
+__attribute__((constructor))
 #endif
-
-#if HAS_ENVIRON
-    {
-        extern char **environ;
+__bound_main_arg(int argc, char **argv, char **envp)
+{
+    __bound_init (0, -1);
+    if (argc && argv) {
+        int i;
 
         WAIT_SEM ();
-        p = environ;
-        start = (char *) p;
+        for (i = 0; i < argc; i++)
+            tree = splay_insert((size_t) argv[i], strlen (argv[i]) + 1, tree);
+        tree = splay_insert((size_t) argv, (argc + 1) * sizeof(char *), tree);
+        POST_SEM ();
+#if BOUND_DEBUG
+        if (print_calls) {
+            for (i = 0; i < argc; i++)
+                dprintf(stderr, "%s, %s(): arg %p 0x%lx\n",
+                        __FILE__, __FUNCTION__,
+                        argv[i], (unsigned long)(strlen (argv[i]) + 1));
+            dprintf(stderr, "%s, %s(): argv %p 0x%lx\n",
+                    __FILE__, __FUNCTION__, argv, (argc + 1) * sizeof(char *));
+        }
+#endif
+    }
+
+    if (envp && *envp) {
+        char **p = envp;
+
+        WAIT_SEM ();
         while (*p) {
             tree = splay_insert((size_t) *p, strlen (*p) + 1, tree);
             ++p;
         }
-        tree = splay_insert((size_t) start, (char *) p - start, tree);
+        tree = splay_insert((size_t) envp, (++p - envp) * sizeof(char *), tree);
         POST_SEM ();
 #if BOUND_DEBUG
         if (print_calls) {
-            p = environ;
+            p = envp;
             while (*p) {
-                dprintf(stderr, "%s, %s(): %p 0x%lx\n",
+                dprintf(stderr, "%s, %s(): env %p 0x%lx\n",
                         __FILE__, __FUNCTION__,
                         *p, (unsigned long)(strlen (*p) + 1));
                 ++p;
             }
             dprintf(stderr, "%s, %s(): environ %p 0x%lx\n",
-                    __FILE__, __FUNCTION__,
-                    start, (unsigned long)((char *) p - start));
+                    __FILE__, __FUNCTION__, envp, (++p - envp) * sizeof(char *));
         }
 #endif
     }
-#endif
 }
 
 void __attribute__((destructor)) __bound_exit(void)
@@ -797,7 +1003,7 @@ void __attribute__((destructor)) __bound_exit(void)
     dprintf(stderr, "%s, %s():\n", __FILE__, __FUNCTION__);
 
     if (inited) {
-#if !defined(_WIN32)
+#if !defined(_WIN32) && !defined(__APPLE__)
         if (print_heap) {
             extern void __libc_freeres (void);
             __libc_freeres ();
@@ -811,21 +1017,19 @@ void __attribute__((destructor)) __bound_exit(void)
             alloca_list_type *next = alloca_list->next;
 
             tree = splay_delete ((size_t) alloca_list->p, tree);
-#if MALLOC_REDIR
-            free_redir (alloca_list);
-#else
-            free (alloca_list);
-#endif
+            BOUND_FREE (alloca_list);
             alloca_list = next;
+        }
+        while (jmp_list) {
+           jmp_list_type *next  = jmp_list->next;
+
+           BOUND_FREE (jmp_list);
+           jmp_list = next;
         }
         for (i = 0; i < FREE_REUSE_SIZE; i++) {
             if (free_reuse_list[i]) {
                 tree = splay_delete ((size_t) free_reuse_list[i], tree);
-#if MALLOC_REDIR
-                free_redir (free_reuse_list[i]);
-#else
-                free (free_reuse_list[i]);
-#endif
+                BOUND_FREE (free_reuse_list[i]);
              }
         }
         while (tree) {
@@ -838,11 +1042,7 @@ void __attribute__((destructor)) __bound_exit(void)
 #if TREE_REUSE
         while (tree_free_list) {
             Tree *next = tree_free_list->left;
-#if MALLOC_REDIR
-            free_redir (tree_free_list);
-#else
-            free (tree_free_list);
-#endif
+            BOUND_FREE (tree_free_list);
             tree_free_list = next;
         }
 #endif
@@ -868,6 +1068,8 @@ void __attribute__((destructor)) __bound_exit(void)
             fprintf (stderr, "bound_mmap_count         %llu\n", bound_mmap_count);
             fprintf (stderr, "bound_munmap_count       %llu\n", bound_munmap_count);
             fprintf (stderr, "bound_alloca_count       %llu\n", bound_alloca_count);
+            fprintf (stderr, "bound_setjmp_count       %llu\n", bound_setjmp_count);
+            fprintf (stderr, "bound_longjmp_count      %llu\n", bound_longjmp_count);
             fprintf (stderr, "bound_mempcy_count       %llu\n", bound_mempcy_count);
             fprintf (stderr, "bound_memcmp_count       %llu\n", bound_memcmp_count);
             fprintf (stderr, "bound_memmove_count      %llu\n", bound_memmove_count);
@@ -913,7 +1115,7 @@ void *__bound_malloc(size_t size, const void *caller)
 #if MALLOC_REDIR
     /* This will catch the first dlsym call from __bound_init */
     if (malloc_redir == NULL) {
-        __bound_init (0);
+        __bound_init (0, -1);
         if (malloc_redir == NULL) {
             ptr = &initial_pool[pool_index];
             pool_index = (pool_index + size + 15) & ~15;
@@ -928,11 +1130,7 @@ void *__bound_malloc(size_t size, const void *caller)
     /* we allocate one more byte to ensure the regions will be
        separated by at least one byte. With the glibc malloc, it may
        be in fact not necessary */
-#if MALLOC_REDIR
-    ptr = malloc_redir (size + 1);
-#else
-    ptr = malloc(size + 1);
-#endif
+    ptr = BOUND_MALLOC (size + 1);
     dprintf(stderr, "%s, %s(): %p, 0x%lx\n",
             __FILE__, __FUNCTION__, ptr, (unsigned long)size);
     
@@ -941,7 +1139,7 @@ void *__bound_malloc(size_t size, const void *caller)
         INCR_COUNT(bound_malloc_count);
 
         if (ptr) {
-            tree = splay_insert ((size_t) ptr, size, tree);
+            tree = splay_insert ((size_t) ptr, size ? size : size + 1, tree);
             if (tree && tree->start == (size_t) ptr)
                 tree->type = TCC_TYPE_MALLOC;
         }
@@ -962,22 +1160,14 @@ void *__bound_memalign(size_t size, size_t align, const void *caller)
     /* we allocate one more byte to ensure the regions will be
        separated by at least one byte. With the glibc malloc, it may
        be in fact not necessary */
-#if MALLOC_REDIR
-    ptr = memalign_redir(size + 1, align);
-#else
-    ptr = memalign(size + 1, align);
-#endif
+    ptr = BOUND_MEMALIGN(size + 1, align);
 #else
     if (align > 4) {
         /* XXX: handle it ? */
         ptr = NULL;
     } else {
         /* we suppose that malloc aligns to at least four bytes */
-#if MALLOC_REDIR
-        ptr = malloc_redir(size + 1);
-#else
-        ptr = malloc(size + 1);
-#endif
+        ptr = BOUND_MALLOC(size + 1);
     }
 #endif
     dprintf(stderr, "%s, %s(): %p, 0x%lx\n",
@@ -988,7 +1178,7 @@ void *__bound_memalign(size_t size, size_t align, const void *caller)
         INCR_COUNT(bound_memalign_count);
 
         if (ptr) {
-            tree = splay_insert((size_t) ptr, size, tree);
+            tree = splay_insert((size_t) ptr, size ? size : size + 1, tree);
             if (tree && tree->start == (size_t) ptr)
                 tree->type = TCC_TYPE_MEMALIGN;
         }
@@ -1006,7 +1196,7 @@ void __bound_free(void *ptr, const void *caller)
     size_t addr = (size_t) ptr;
     void *p;
 
-    if (ptr == NULL || tree == NULL || no_checking
+    if (ptr == NULL || tree == NULL
 #if MALLOC_REDIR
         || ((unsigned char *) ptr >= &initial_pool[0] &&
             (unsigned char *) ptr < &initial_pool[sizeof(initial_pool)])
@@ -1016,30 +1206,28 @@ void __bound_free(void *ptr, const void *caller)
 
     dprintf(stderr, "%s, %s(): %p\n", __FILE__, __FUNCTION__, ptr);
 
-    WAIT_SEM ();
-    INCR_COUNT(bound_free_count);
-    tree = splay (addr, tree);
-    if (tree->start == addr) {
-        if (tree->is_invalid) {
-            POST_SEM ();
-            bound_error("freeing invalid region");
-            return;
+    if (no_checking == 0) {
+        WAIT_SEM ();
+        INCR_COUNT(bound_free_count);
+        tree = splay (addr, tree);
+        if (tree->start == addr) {
+            if (tree->is_invalid) {
+                POST_SEM ();
+                bound_error("freeing invalid region");
+                return;
+            }
+            tree->is_invalid = 1;
+            memset (ptr, 0x5a, tree->size);
+            p = free_reuse_list[free_reuse_index];
+            free_reuse_list[free_reuse_index] = ptr;
+            free_reuse_index = (free_reuse_index + 1) % FREE_REUSE_SIZE;
+            if (p)
+                tree = splay_delete((size_t)p, tree);
+            ptr = p;
         }
-        tree->is_invalid = 1;
-        memset (ptr, 0x5a, tree->size);
-        p = free_reuse_list[free_reuse_index];
-        free_reuse_list[free_reuse_index] = ptr;
-        free_reuse_index = (free_reuse_index + 1) % FREE_REUSE_SIZE;
-        if (p)
-            tree = splay_delete((size_t)p, tree);
-        ptr = p;
+        POST_SEM ();
     }
-    POST_SEM ();
-#if MALLOC_REDIR
-    free_redir (ptr);
-#else
-    free(ptr);
-#endif
+    BOUND_FREE (ptr);
 }
 
 #if MALLOC_REDIR
@@ -1059,11 +1247,7 @@ void *__bound_realloc(void *ptr, size_t size, const void *caller)
         return NULL;
     }
 
-#if MALLOC_REDIR
-    new_ptr = realloc_redir (ptr, size);
-#else
-    new_ptr = realloc (ptr, size);
-#endif
+    new_ptr = BOUND_REALLOC (ptr, size + 1);
     dprintf(stderr, "%s, %s(): %p, 0x%lx\n",
             __FILE__, __FUNCTION__, new_ptr, (unsigned long)size);
 
@@ -1074,7 +1258,7 @@ void *__bound_realloc(void *ptr, size_t size, const void *caller)
         if (ptr)
             tree = splay_delete ((size_t) ptr, tree);
         if (new_ptr) {
-            tree = splay_insert ((size_t) new_ptr, size, tree);
+            tree = splay_insert ((size_t) new_ptr, size ? size : size + 1, tree);
             if (tree && tree->start == (size_t) new_ptr)
                 tree->type = TCC_TYPE_REALLOC;
         }
@@ -1095,7 +1279,7 @@ void *__bound_calloc(size_t nmemb, size_t size)
 #if MALLOC_REDIR
     /* This will catch the first dlsym call from __bound_init */
     if (malloc_redir == NULL) {
-        __bound_init (0);
+        __bound_init (0, -1);
         if (malloc_redir == NULL) {
             ptr = &initial_pool[pool_index];
             pool_index = (pool_index + size + 15) & ~15;
@@ -1108,11 +1292,7 @@ void *__bound_calloc(size_t nmemb, size_t size)
         }
     }
 #endif
-#if MALLOC_REDIR
-    ptr = malloc_redir(size + 1);
-#else
-    ptr = malloc(size + 1);
-#endif
+    ptr = BOUND_MALLOC(size + 1);
     dprintf (stderr, "%s, %s(): %p, 0x%lx\n",
              __FILE__, __FUNCTION__, ptr, (unsigned long)size);
 
@@ -1121,7 +1301,7 @@ void *__bound_calloc(size_t nmemb, size_t size)
         if (no_checking == 0) {
             WAIT_SEM ();
             INCR_COUNT(bound_calloc_count);
-            tree = splay_insert ((size_t) ptr, size, tree);
+            tree = splay_insert ((size_t) ptr, size ? size : size + 1, tree);
             if (tree && tree->start == (size_t) ptr)
                 tree->type = TCC_TYPE_CALLOC;
             POST_SEM ();
@@ -1170,8 +1350,7 @@ int __bound_munmap (void *start, size_t size)
 /* check that (p ... p + size - 1) lies inside 'p' region, if any */
 static void __bound_check(const void *p, size_t size, const char *function)
 {
-    if (no_checking == 0 && size != 0 &&
-        __bound_ptr_add((void *)p, size) == INVALID_POINTER) {
+    if (size != 0 && __bound_ptr_add((void *)p, size) == INVALID_POINTER) {
         bound_error("invalid pointer %p, size 0x%lx in %s",
                 p, (unsigned long)size, function);
     }
@@ -1248,6 +1427,59 @@ void *__bound_memset(void *s, int c, size_t n)
     __bound_check(s, n, "memset");
     return memset(s, c, n);
 }
+
+#if defined(__arm__)
+void *__bound___aeabi_memcpy(void *dest, const void *src, size_t n)
+{
+    dprintf(stderr, "%s, %s(): %p, %p, 0x%lx\n",
+            __FILE__, __FUNCTION__, dest, src, (unsigned long)n);
+    INCR_COUNT(bound_mempcy_count);
+    __bound_check(dest, n, "memcpy dest");
+    __bound_check(src, n, "memcpy src");
+    if (check_overlap(dest, n, src, n, "memcpy"))
+        return dest;
+    return __aeabi_memcpy(dest, src, n);
+}
+
+void *__bound___aeabi_memmove(void *dest, const void *src, size_t n)
+{
+    dprintf(stderr, "%s, %s(): %p, %p, 0x%lx\n",
+            __FILE__, __FUNCTION__, dest, src, (unsigned long)n);
+    INCR_COUNT(bound_memmove_count);
+    __bound_check(dest, n, "memmove dest");
+    __bound_check(src, n, "memmove src");
+    return __aeabi_memmove(dest, src, n);
+}
+
+void *__bound___aeabi_memmove4(void *dest, const void *src, size_t n)
+{
+    dprintf(stderr, "%s, %s(): %p, %p, 0x%lx\n",
+            __FILE__, __FUNCTION__, dest, src, (unsigned long)n);
+    INCR_COUNT(bound_memmove_count);
+    __bound_check(dest, n, "memmove dest");
+    __bound_check(src, n, "memmove src");
+    return __aeabi_memmove4(dest, src, n);
+}
+
+void *__bound___aeabi_memmove8(void *dest, const void *src, size_t n)
+{
+    dprintf(stderr, "%s, %s(): %p, %p, 0x%lx\n",
+            __FILE__, __FUNCTION__, dest, src, (unsigned long)n);
+    INCR_COUNT(bound_memmove_count);
+    __bound_check(dest, n, "memmove dest");
+    __bound_check(src, n, "memmove src");
+    return __aeabi_memmove8(dest, src, n);
+}
+
+void *__bound___aeabi_memset(void *s, int c, size_t n)
+{
+    dprintf(stderr, "%s, %s(): %p, %d, 0x%lx\n",
+            __FILE__, __FUNCTION__, s, c, (unsigned long)n);
+    INCR_COUNT(bound_memset_count);
+    __bound_check(s, n, "memset");
+    return __aeabi_memset(s, c, n);
+}
+#endif
 
 int __bound_strlen(const char *s)
 {
@@ -1377,11 +1609,7 @@ char *__bound_strdup(const char *s)
     INCR_COUNT(bound_strdup_count);
     while (*p++);
     __bound_check(s, p - s, "strdup");
-#if MALLOC_REDIR
-    new = malloc_redir ((p - s) + 1);
-#else
-    new = malloc ((p - s) + 1);
-#endif
+    new = BOUND_MALLOC ((p - s) + 1);
     dprintf(stderr, "%s, %s(): %p, 0x%lx\n",
             __FILE__, __FUNCTION__, new, (unsigned long)(p -s));
     if (new) {
@@ -1574,11 +1802,7 @@ static Tree * splay_insert(size_t addr, size_t size, Tree * t)
     else
 #endif
     {
-#if MALLOC_REDIR
-        new = (Tree *) malloc_redir (sizeof (Tree));
-#else
-        new = (Tree *) malloc (sizeof (Tree));
-#endif
+        new = (Tree *) BOUND_MALLOC (sizeof (Tree));
     }
     if (new == NULL) {
         bound_alloc_error("not enough memory for bound checking code");
@@ -1626,11 +1850,7 @@ static Tree * splay_delete(size_t addr, Tree *t)
         t->left = tree_free_list;
         tree_free_list = t;
 #else
-#if MALLOC_REDIR
-        free_redir(t);
-#else
-        free(t);
-#endif
+        BOUND_FREE(t);
 #endif
         return x;
     } else {

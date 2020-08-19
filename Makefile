@@ -25,13 +25,14 @@ CFLAGS += $(CPPFLAGS)
 VPATH = $(TOPSRC)
 
 ifdef CONFIG_WIN32
+ CFG = -win
  ifneq ($(CONFIG_static),yes)
   LIBTCC = libtcc$(DLLSUF)
   LIBTCCDEF = libtcc.def
  endif
- CFGWIN = -win
  NATIVE_TARGET = $(ARCH)-win$(if $(findstring arm,$(ARCH)),ce,32)
 else
+ CFG = -unx
  LIBS=-lm -lpthread
  ifneq ($(CONFIG_ldl),no)
   LIBS+=-ldl
@@ -41,26 +42,33 @@ else
   LIBTCC=libtcc$(DLLSUF)
   export LD_LIBRARY_PATH := $(CURDIR)/$(TOP)
   ifneq ($(CONFIG_rpath),no)
-   LINK_LIBTCC += -Wl,-rpath,"$(libdir)"
+    ifndef CONFIG_OSX
+      LINK_LIBTCC += -Wl,-rpath,"$(libdir)"
+    else
+      # macOS doesn't support env-vars libdir out of the box - which we need for
+      # `make test' when libtcc.dylib is used (configure --disable-static), so
+      # we bake a relative path into the binary. $libdir is used after install.
+      LINK_LIBTCC += -Wl,-rpath,"@executable_path/$(TOP)" -Wl,-rpath,"$(libdir)"
+      DYLIBVER += -current_version $(VERSION)
+      DYLIBVER += -compatibility_version $(VERSION)
+    endif
   endif
  endif
- CFGWIN =-unx
  NATIVE_TARGET = $(ARCH)
  ifdef CONFIG_OSX
   NATIVE_TARGET = $(ARCH)-osx
-  LDFLAGS += -flat_namespace -undefined warning
-  export MACOSX_DEPLOYMENT_TARGET := 10.4
+  ifneq ($(CC_NAME),tcc)
+    LDFLAGS += -flat_namespace -undefined warning
+  endif
+  export MACOSX_DEPLOYMENT_TARGET := 10.6
  endif
 endif
 
 # run local version of tcc with local libraries and includes
 TCCFLAGS-unx = -B$(TOP) -I$(TOPSRC)/include -I$(TOPSRC) -I$(TOP)
 TCCFLAGS-win = -B$(TOPSRC)/win32 -I$(TOPSRC)/include -I$(TOPSRC) -I$(TOP) -L$(TOP)
-TCCFLAGS = $(TCCFLAGS$(CFGWIN))
+TCCFLAGS = $(TCCFLAGS$(CFG))
 TCC = $(TOP)/tcc$(EXESUF) $(TCCFLAGS)
-ifdef CONFIG_OSX
- TCCFLAGS += -D_ANSI_SOURCE
-endif
 
 # cross compiler targets to build
 TCC_X = i386 x86_64 i386-win32 x86_64-win32 x86_64-osx arm arm64 arm-wince c67
@@ -111,9 +119,9 @@ cross: $(LIBTCC1_CROSS) $(PROGS_CROSS)
 # build specific cross compiler & lib
 cross-%: %-tcc$(EXESUF) %-libtcc1.a ;
 
-install: ; @$(MAKE) --no-print-directory  install$(CFGWIN)
-install-strip: ; @$(MAKE) --no-print-directory  install$(CFGWIN) CONFIG_strip=yes
-uninstall: ; @$(MAKE) --no-print-directory uninstall$(CFGWIN)
+install: ; @$(MAKE) --no-print-directory  install$(CFG)
+install-strip: ; @$(MAKE) --no-print-directory  install$(CFG) CONFIG_strip=yes
+uninstall: ; @$(MAKE) --no-print-directory uninstall$(CFG)
 
 ifdef CONFIG_cross
 all : cross
@@ -167,7 +175,7 @@ i386_FILES = $(CORE_FILES) i386-gen.c i386-link.c i386-asm.c i386-asm.h i386-tok
 i386-win32_FILES = $(i386_FILES) tccpe.c
 x86_64_FILES = $(CORE_FILES) x86_64-gen.c x86_64-link.c i386-asm.c x86_64-asm.h
 x86_64-win32_FILES = $(x86_64_FILES) tccpe.c
-x86_64-osx_FILES = $(x86_64_FILES)
+x86_64-osx_FILES = $(x86_64_FILES) tccmacho.c
 arm_FILES = $(CORE_FILES) arm-gen.c arm-link.c arm-asm.c
 arm-wince_FILES = $(arm_FILES) tccpe.c
 arm-eabihf_FILES = $(arm_FILES)
@@ -176,9 +184,9 @@ arm-fpa-ld_FILES  = $(arm_FILES)
 arm-vfp_FILES     = $(arm_FILES)
 arm-eabi_FILES    = $(arm_FILES)
 arm-eabihf_FILES  = $(arm_FILES)
-arm64_FILES = $(CORE_FILES) arm64-gen.c arm64-link.c
+arm64_FILES = $(CORE_FILES) arm64-gen.c arm64-link.c arm-asm.c
 c67_FILES = $(CORE_FILES) c67-gen.c c67-link.c tcccoff.c
-riscv64_FILES = $(CORE_FILES) riscv64-gen.c riscv64-link.c
+riscv64_FILES = $(CORE_FILES) riscv64-gen.c riscv64-link.c riscv64-asm.c
 
 # libtcc sources
 LIBTCC_SRC = $(filter-out tcc.c tcctools.c,$(filter %.c,$($T_FILES)))
@@ -200,7 +208,9 @@ CFLAGS += -g
 LDFLAGS += -g
 else
 CONFIG_strip = yes
+ifndef CONFIG_OSX
 LDFLAGS += -s
+endif
 endif
 
 # target specific object rule
@@ -236,8 +246,13 @@ libtcc.so: $(LIBTCC_OBJ)
 libtcc.so: CFLAGS+=-fPIC
 libtcc.so: LDFLAGS+=-fPIC
 
+# OSX dynamic libtcc library
 libtcc.dylib: $(LIBTCC_OBJ)
-	$(CC) -shared -o libtcc.dylib libtcc.o tccpp.o tccgen.o tccelf.o tccasm.o tccrun.o x86_64-gen.o x86_64-link.o i386-asm.o  -flat_namespace
+	$S$(CC) -dynamiclib $(DYLIBVER) -install_name @rpath/$@ -o $@ $^ $(LDFLAGS) 
+
+# OSX libtcc.dylib (without rpath/ prefix)
+libtcc.osx: $(LIBTCC_OBJ)
+	$S$(CC) -shared -install_name libtcc.dylib -o libtcc.dylib $^ $(LDFLAGS) 
 
 # windows dynamic libtcc library
 libtcc.dll : $(LIBTCC_OBJ)
@@ -314,7 +329,7 @@ endif
 # uninstall
 uninstall-unx:
 	@rm -fv $(foreach P,$(PROGS) $(PROGS_CROSS),"$(bindir)/$P")
-	@rm -fv "$(libdir)/libtcc.a" "$(libdir)/libtcc.so" "$(includedir)/libtcc.h"
+	@rm -fv "$(libdir)/libtcc.a" "$(libdir)/libtcc.so" "$(libdir)/libtcc.dylib" "$(includedir)/libtcc.h"
 	@rm -fv "$(mandir)/man1/tcc.1" "$(infodir)/tcc-doc.info"
 	@rm -fv "$(docdir)/tcc-doc.html"
 	@rm -frv "$(tccdir)"
@@ -343,7 +358,7 @@ endif
 
 # uninstall on windows
 uninstall-win:
-	@rm -fv $(foreach P,libtcc.dll $(PROGS) *-tcc.exe,"$(bindir)/$P")
+	@rm -fv $(foreach P,libtcc.dll $(PROGS) *-tcc.exe,"$(bindir)"/$P)
 	@rm -fr $(foreach P,doc examples include lib libtcc,"$(tccdir)/$P"/*)
 	@rm -frv $(foreach P,doc examples include lib libtcc,"$(tccdir)/$P")
 

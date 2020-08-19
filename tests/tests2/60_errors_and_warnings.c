@@ -118,6 +118,13 @@ enum e5;
 void f3(enum e4 e);
 void f3(enum e5 e);
 
+#elif defined test_enum_compat_2
+enum e6 { E1 = -1, E0 };
+void f3(enum e6);
+void f3(int);        // should work as int and e6 are compatible
+void f4(enum e6 e);
+void f4(unsigned e); // should error as unsigned and e6 are incompatible
+
 #elif defined test_ptr_to_str
 void f() { _Generic((int const *[]){0}, int:0); }
 #elif defined test_fnptr_to_str
@@ -318,5 +325,25 @@ int main()
     int n = _Generic(*a, double:0, long double:1);
 }
 
+#elif defined test_stray_backslash
+#define x \a
+x
+
+#elif defined test_stray_backslash2
+int printf(const char*, ...);
+int main()
+{
+#define _S(x) #x
+#define S(x) _S(x)
+    printf("%sn\n", S(\\));
+}
+
 /******************************************************************/
+#elif defined test_var_array
+
+static struct var_len { int i; const char str[]; } var_array[] =
+{ { 1, "abcdefghijklmnopqrstuvwxyz" },
+  { 2, "longlonglonglonglong" },
+  { 3, "tst3" } };
+
 #endif

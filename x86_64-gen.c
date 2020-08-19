@@ -149,7 +149,7 @@ static int func_ret_sub;
 #if defined(CONFIG_TCC_BCHECK)
 static addr_t func_bound_offset;
 static unsigned long func_bound_ind;
-static int func_bound_alloca_used;
+ST_DATA int func_bound_add_epilog;
 #endif
 
 #ifdef TCC_TARGET_PE
@@ -441,6 +441,9 @@ void load(int r, SValue *sv)
             b = 0xbf0f;   /* movswl */
         } else if ((ft & VT_TYPE) == (VT_SHORT | VT_UNSIGNED)) {
             b = 0xb70f;   /* movzwl */
+        } else if ((ft & VT_TYPE) == (VT_VOID)) {
+            /* Can happen with zero size structs */
+            return;
         } else {
             assert(((ft & VT_BTYPE) == VT_INT)
                    || ((ft & VT_BTYPE) == VT_LLONG)
@@ -636,10 +639,6 @@ static void gcall_or_jmp(int is_jmp)
         greloca(cur_text_section, vtop->sym, ind + 1, R_X86_64_PLT32, (int)(vtop->c.i-4));
 #endif
         oad(0xe8 + is_jmp, 0); /* call/jmp im */
-#ifdef CONFIG_TCC_BCHECK
-        if (tcc_state->do_bounds_check && vtop->sym->v == TOK_alloca)
-            func_bound_alloca_used = 1;
-#endif
     } else {
         /* otherwise, indirect call */
         r = TREG_R11;
@@ -663,57 +662,6 @@ static void gen_bounds_call(int v)
 #endif
 }
 
-/* generate a bounded pointer addition */
-ST_FUNC void gen_bounded_ptr_add(void)
-{
-    vpush_global_sym(&func_old_type, TOK___bound_ptr_add);
-    vrott(3);
-    gfunc_call(2);
-    vpushi(0);
-    /* returned pointer is in rax */
-    vtop->r = TREG_RAX | VT_BOUNDED;
-    if (nocode_wanted)
-        return;
-    /* relocation offset of the bounding function call point */
-    vtop->c.i = (cur_text_section->reloc->data_offset - sizeof(ElfW(Rela)));
-}
-
-/* patch pointer addition in vtop so that pointer dereferencing is
-   also tested */
-ST_FUNC void gen_bounded_ptr_deref(void)
-{
-    addr_t func;
-    int size, align;
-    ElfW(Rela) *rel;
-    Sym *sym;
-
-    if (nocode_wanted)
-        return;
-
-    size = type_size(&vtop->type, &align);
-    switch(size) {
-    case  1: func = TOK___bound_ptr_indir1; break;
-    case  2: func = TOK___bound_ptr_indir2; break;
-    case  4: func = TOK___bound_ptr_indir4; break;
-    case  8: func = TOK___bound_ptr_indir8; break;
-    case 12: func = TOK___bound_ptr_indir12; break;
-    case 16: func = TOK___bound_ptr_indir16; break;
-    default:
-        /* may happen with struct member access */
-        return;
-        //tcc_error("unhandled size when dereferencing bounded pointer");
-        //func = 0;
-        //break;
-    }
-    sym = external_global_sym(func, &func_old_type);
-    if (!sym->c)
-        put_extern_sym(sym, NULL, 0, 0);
-    /* patch relocation */
-    /* XXX: find a better solution ? */
-    rel = (ElfW(Rela) *)(cur_text_section->reloc->data + vtop->c.i);
-    rel->r_info = ELF64_R_INFO(sym->c, ELF64_R_TYPE(rel->r_info));
-}
-
 #ifdef TCC_TARGET_PE
 # define TREG_FASTCALL_1 TREG_RCX
 #else
@@ -725,7 +673,7 @@ static void gen_bounds_prolog(void)
     /* leave some room for bound checking code */
     func_bound_offset = lbounds_section->data_offset;
     func_bound_ind = ind;
-    func_bound_alloca_used = 0;
+    func_bound_add_epilog = 0;
     o(0xb848 + TREG_FASTCALL_1 * 0x100); /*lbound section pointer */
     gen_le64 (0);
     oad(0xb8, 0); /* call to function */
@@ -736,31 +684,35 @@ static void gen_bounds_epilog(void)
     addr_t saved_ind;
     addr_t *bounds_ptr;
     Sym *sym_data;
+    int offset_modified = func_bound_offset != lbounds_section->data_offset;
 
-    if (func_bound_offset == lbounds_section->data_offset && !func_bound_alloca_used)
+    if (!offset_modified && !func_bound_add_epilog)
         return;
 
     /* add end of table info */
     bounds_ptr = section_ptr_add(lbounds_section, sizeof(addr_t));
     *bounds_ptr = 0;
 
-    /* generate bound local allocation */
     sym_data = get_sym_ref(&char_pointer_type, lbounds_section, 
                            func_bound_offset, lbounds_section->data_offset);
-    saved_ind = ind;
-    ind = func_bound_ind;
-    greloca(cur_text_section, sym_data, ind + 2, R_X86_64_64, 0);
-    ind = ind + 10;
-    gen_bounds_call(TOK___bound_local_new);
-    ind = saved_ind;
+
+    /* generate bound local allocation */
+    if (offset_modified) {
+        saved_ind = ind;
+        ind = func_bound_ind;
+        greloca(cur_text_section, sym_data, ind + 2, R_X86_64_64, 0);
+        ind = ind + 10;
+        gen_bounds_call(TOK___bound_local_new);
+        ind = saved_ind;
+    }
 
     /* generate bound check local freeing */
-    o(0x525051); /* save returned value, if any (+ scratch-space for windows) */
+    o(0x5250); /* save returned value, if any */
     greloca(cur_text_section, sym_data, ind + 2, R_X86_64_64, 0);
     o(0xb848 + TREG_FASTCALL_1 * 0x100); /* mov xxx, %rcx/di */
     gen_le64 (0);
     gen_bounds_call(TOK___bound_local_delete);
-    o(0x59585a); /* restore returned value, if any */
+    o(0x585a); /* restore returned value, if any */
 }
 #endif
 
@@ -1274,11 +1226,11 @@ void gfunc_call(int nb_args)
 {
     X86_64_Mode mode;
     CType type;
-    int size, align, r, args_size, stack_adjust, i, reg_count;
+    int size, align, r, args_size, stack_adjust, i, reg_count, k;
     int nb_reg_args = 0;
     int nb_sse_args = 0;
     int sse_reg, gen_reg;
-    char _onstack[nb_args ? nb_args : 1], *onstack = _onstack;
+    char *onstack = tcc_malloc((nb_args + 1) * sizeof (char));
 
 #ifdef CONFIG_TCC_BCHECK
     if (tcc_state->do_bounds_check)
@@ -1324,9 +1276,9 @@ void gfunc_call(int nb_args)
     sse_reg = nb_sse_args;
     args_size = 0;
     stack_adjust &= 15;
-    for (i = 0; i < nb_args;) {
+    for (i = k = 0; i < nb_args;) {
 	mode = classify_x86_64_arg(&vtop[-i].type, NULL, &size, &align, &reg_count);
-	if (!onstack[i]) {
+	if (!onstack[i + k]) {
 	    ++i;
 	    continue;
 	}
@@ -1339,7 +1291,7 @@ void gfunc_call(int nb_args)
             args_size += 8;
 	    stack_adjust = 0;
         }
-	if (onstack[i] == 2)
+	if (onstack[i + k] == 2)
 	  stack_adjust = 1;
 
 	vrotb(i+1);
@@ -1389,8 +1341,10 @@ void gfunc_call(int nb_args)
 
 	vpop();
 	--nb_args;
-	onstack++;
+	k++;
     }
+
+    tcc_free(onstack);
 
     /* XXX This should be superfluous.  */
     save_regs(0); /* save used temporary registers */

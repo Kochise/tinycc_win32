@@ -35,9 +35,18 @@ endif
 ifeq ($(ARCH),x86_64)
  TESTS += $(BTESTS)
 endif
+ifeq ($(ARCH),arm)
+ TESTS += $(BTESTS)
 endif
-ifdef CONFIG_OSX # -run only
- TESTS := hello-run libtest tests2-dir pp-dir
+ifeq ($(ARCH),arm64)
+ TESTS += $(BTESTS)
+endif
+ifeq ($(ARCH),riscv64)
+ TESTS += $(BTESTS)
+endif
+endif
+ifdef CONFIG_OSX # some don't work yet
+ TESTS := $(filter-out dlltest, $(TESTS))
 endif
 ifeq (,$(filter arm64 i386 x86_64,$(ARCH)))
  TESTS := $(filter-out vla_test-run,$(TESTS))
@@ -53,6 +62,11 @@ ifeq ($(OS),Windows_NT) # for libtcc_test to find libtcc.dll
  PATH := $(CURDIR)/$(TOP)$(if $(findstring ;,$(PATH)),;,:)$(PATH)
 endif
 
+ifdef CONFIG_OSX
+LIBS += $(LINK_LIBTCC)
+endif
+
+
 ifeq ($(ARCH),arm)
 # tcctest refers to the alignment of functions, and with thumb mode
 # the low bit of code addresses selects the mode, so the "alignment"
@@ -64,10 +78,17 @@ ifeq ($(ARCH),i386)
 # by GCC in 32bit mode when PIC is enabled.
 test.ref: CFLAGS+=-fno-PIC -fno-PIE
 endif
+ifeq ($(CC_NAME),msvc)
+test.ref abitest : CC = gcc
+endif
 
 RUN_TCC = $(NATIVE_DEFINES) -run $(TOPSRC)/tcc.c $(TCCFLAGS)
 DISAS = objdump -d
+ifdef CONFIG_OSX
+DUMPTCC = (set -x; $(TOP)/tcc -vv; otool -L $(TOP)/tcc; exit 1)
+else
 DUMPTCC = (set -x; $(TOP)/tcc -vv; ldd $(TOP)/tcc; exit 1)
+endif
 
 all test :
 	@$(MAKE) --no-print-directory -s clean
@@ -170,7 +191,7 @@ memtest:
 
 # memory and bound check auto test
 BOUNDS_OK  = 1 4 8 10 14 16
-BOUNDS_FAIL= 2 5 6 7 9 11 12 13 15 17
+BOUNDS_FAIL= 2 5 6 7 9 11 12 13 15 17 18
 
 btest: boundtest.c
 	@echo ------------ $@ ------------
@@ -293,7 +314,7 @@ clean:
 	rm -f *~ *.o *.a *.bin *.i *.ref *.out *.out? *.out?b *.cc *.gcc
 	rm -f *-cc *-gcc *-tcc *.exe hello libtcc_test vla_test tcctest[1234]
 	rm -f asm-c-connect$(EXESUF) asm-c-connect-sep$(EXESUF)
-	rm -f ex? tcc_g weaktest.*.txt *.def libtcc_test_mt
+	rm -f ex? tcc_g weaktest.*.txt *.def *.pdb *.obj libtcc_test_mt
 	@$(MAKE) -C tests2 $@
 	@$(MAKE) -C pp $@
 

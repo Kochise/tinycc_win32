@@ -14,7 +14,7 @@ ifeq ($(CONFIG_arm_eabi),yes) # not ARM soft-float
 endif
 ifdef CONFIG_OSX
  SKIP += 40_stdio.test 42_function_pointer.test
- FLAGS += -w
+ SKIP += 113_btdll.test # no shared lib support yet
 endif
 ifeq ($(ARCH),x86_64)
  SKIP += 73_arm64.test
@@ -23,9 +23,14 @@ ifeq (,$(filter i386,$(ARCH)))
  SKIP += 98_al_ax_extend.test 99_fastcall.test
 endif
 ifeq (,$(filter i386 x86_64,$(ARCH)))
- SKIP += 85_asm-outside-function.test
- SKIP += 112_backtrace.test 113_btdll.test
+ SKIP += 85_asm-outside-function.test # x86 asm
+ SKIP += 113_btdll.test # dll support needed
+endif
+ifeq (,$(filter i386 x86_64 arm arm64 riscv64,$(ARCH)))
+ SKIP += 112_backtrace.test
  SKIP += 114_bound_signal.test
+ SKIP += 115_bound_setjmp.test
+ SKIP += 116_bound_setjmp2.test
 endif
 ifeq (-$(CONFIG_musl)-,-yes-)
  SKIP += 112_backtrace.test
@@ -38,9 +43,7 @@ ifeq (-$(CONFIG_WIN32)-$(CONFIG_i386)$(CONFIG_arm)-,--yes-)
 endif
 ifeq (-$(CONFIG_WIN32)-,-yes-)
  SKIP += 106_pthread.test # No pthread support
-endif
-ifneq (-$(CONFIG_WIN32)-$(findstring $(GCC_MAJOR),3 4)-,---)
- SKIP += 114_bound_signal.test # not on windows or older linuxes
+ SKIP += 114_bound_signal.test # No pthread support
 endif
 
 # Some tests might need arguments
@@ -80,8 +83,8 @@ GEN-ALWAYS =
 
 112_backtrace.test: FLAGS += -dt -b
 112_backtrace.test 113_btdll.test: FILTER += \
-    -e 's;[0-9A-Fa-fx]\{8,\};........;g' \
-    -e 's;0x[0-9A-Fa-f]\+;0x?;g'
+    -e 's;[0-9A-Fa-fx]\{5,\};........;g' \
+    -e 's;0x[0-9A-Fa-f]\{1,\};0x?;g'
 
 # this test creates two DLLs and an EXE
 113_btdll.test: NORUN = true
@@ -91,6 +94,10 @@ GEN-ALWAYS =
     -bt a1$(DLLSUF) a2$(DLLSUF) -Wl,-rpath=.
 
 114_bound_signal.test: FLAGS += -b
+115_bound_setjmp.test: FLAGS += -b
+116_bound_setjmp2.test: FLAGS += -b
+
+117_gcc_test.test: FLAGS += $(T2) && $(TCC) -b
 
 # Filter source directory in warnings/errors (out-of-tree builds)
 FILTER = 2>&1 | sed -e 's,$(SRC)/,,g'

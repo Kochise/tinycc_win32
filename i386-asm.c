@@ -1202,7 +1202,7 @@ ST_FUNC int asm_parse_regvar (int t)
 {
     const char *s;
     Operand op;
-    if (t < TOK_IDENT)
+    if (t < TOK_IDENT || (t & SYM_FIELD))
         return -1;
     s = table_ident[t - TOK_IDENT]->str;
     if (s[0] != '%')
@@ -1490,6 +1490,8 @@ ST_FUNC void subst_asm_operand(CString *add_str,
 		   list when we still know the symbol.  */
 		get_asm_sym(tok_alloc(name, strlen(name))->tok, sv->sym);
 	    }
+            if (tcc_state->leading_underscore)
+              cstr_ccat(add_str, '_');
             cstr_cat(add_str, name, -1);
             if ((uint32_t)sv->c.i == 0)
                 goto no_offset;

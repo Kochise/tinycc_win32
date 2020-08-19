@@ -81,6 +81,12 @@ ST_DATA const int reg_classes[NB_REGS] = {
   RC_FLOAT | RC_F(7)
 };
 
+#if defined(CONFIG_TCC_BCHECK)
+static addr_t func_bound_offset;
+static unsigned long func_bound_ind;
+ST_DATA int func_bound_add_epilog;
+#endif
+
 #define IS_FREG(x) ((x) >= TREG_F(0))
 
 static uint32_t intr(int r)
@@ -277,6 +283,23 @@ static void arm64_spoff(int reg, uint64_t off)
     }
 }
 
+/* invert 0: return value to use for store/load */
+/* invert 1: return value to use for arm64_sym */
+static uint64_t arm64_check_offset(int invert, int sz_, uint64_t off)
+{
+    uint32_t sz = sz_;
+    if (!(off & ~((uint32_t)0xfff << sz)) ||
+        (off < 256 || -off <= 256))
+        return invert ? off : 0ul;
+    else if ((off & ((uint32_t)0xfff << sz)))
+        return invert ? off & ((uint32_t)0xfff << sz)
+		      : off & ~((uint32_t)0xfff << sz);
+    else if (off & 0x1ff)
+        return invert ? off & 0x1ff : off & ~0x1ff;
+    else
+        return invert ? 0ul : off;
+}
+
 static void arm64_ldrx(int sg, int sz_, int dst, int bas, uint64_t off)
 {
     uint32_t sz = sz_;
@@ -317,6 +340,9 @@ static void arm64_ldrs(int reg_, int size)
     // Use x30 for intermediate value in some cases.
     switch (size) {
     default: assert(0); break;
+    case 0:
+        /* Can happen with zero size structs */
+        break;
     case 1:
         arm64_ldrx(0, 0, reg, reg, 0);
         break;
@@ -423,29 +449,27 @@ static void arm64_strv(int sz_, int dst, int bas, uint64_t off)
 
 static void arm64_sym(int r, Sym *sym, unsigned long addend)
 {
-    // Currently TCC's linker does not generate COPY relocations for
-    // STT_OBJECTs when tcc is invoked with "-run". This typically
-    // results in "R_AARCH64_ADR_PREL_PG_HI21 relocation failed" when
-    // a program refers to stdin. A workaround is to avoid that
-    // relocation and use only relocations with unlimited range.
-    int avoid_adrp = 1;
-
-    if (avoid_adrp || sym->a.weak) {
-        // (GCC uses a R_AARCH64_ABS64 in this case.)
-        greloca(cur_text_section, sym, ind, R_AARCH64_MOVW_UABS_G0_NC, addend);
-        o(0xd2800000 | r); // mov x(rt),#0,lsl #0
-        greloca(cur_text_section, sym, ind, R_AARCH64_MOVW_UABS_G1_NC, addend);
-        o(0xf2a00000 | r); // movk x(rt),#0,lsl #16
-        greloca(cur_text_section, sym, ind, R_AARCH64_MOVW_UABS_G2_NC, addend);
-        o(0xf2c00000 | r); // movk x(rt),#0,lsl #32
-        greloca(cur_text_section, sym, ind, R_AARCH64_MOVW_UABS_G3, addend);
-        o(0xf2e00000 | r); // movk x(rt),#0,lsl #48
-    }
-    else {
-        greloca(cur_text_section, sym, ind, R_AARCH64_ADR_PREL_PG_HI21, addend);
-        o(0x90000000 | r);
-        greloca(cur_text_section, sym, ind, R_AARCH64_ADD_ABS_LO12_NC, addend);
-        o(0x91000000 | r | r << 5);
+    greloca(cur_text_section, sym, ind, R_AARCH64_ADR_GOT_PAGE, 0);
+    o(0x90000000 | r);            // adrp xr, #sym
+    greloca(cur_text_section, sym, ind, R_AARCH64_LD64_GOT_LO12_NC, 0);
+    o(0xf9400000 | r | (r << 5)); // ld xr,[xr, #sym]
+    if (addend) {
+        // add xr, xr, #addend
+	if (addend & 0xffful)
+           o(0x91000000 | r | r << 5 | (addend & 0xfff) << 10);
+        if (addend > 0xffful) {
+            // add xr, xr, #addend, lsl #12
+	    if (addend & 0xfff000ul)
+                o(0x91400000 | r | r << 5 | ((addend >> 12) & 0xfff) << 10);
+            if (addend > 0xfffffful) {
+		/* very unlikely */
+		int t = r ? 0 : 1;
+		o(0xf81f0fe0 | t);            /* str xt, [sp, #-16]! */
+		arm64_movimm(t, addend & ~0xfffffful); // use xt for addent
+		o(0x91000000 | r | (t << 5)); /* add xr, xt, #0 */
+		o(0xf84107e0 | t);            /* ldr xt, [sp], #16 */
+	    }
+        }
     }
 }
 
@@ -454,7 +478,7 @@ static void arm64_load_cmp(int r, SValue *sv);
 ST_FUNC void load(int r, SValue *sv)
 {
     int svtt = sv->type.t;
-    int svr = sv->r;
+    int svr = sv->r & ~VT_BOUNDED;
     int svrv = svr & VT_VALMASK;
     uint64_t svcul = (uint32_t)sv->c.i;
     svcul = svcul >> 31 & 1 ? svcul - ((uint64_t)1 << 32) : svcul;
@@ -468,22 +492,38 @@ ST_FUNC void load(int r, SValue *sv)
         return;
     }
 
-    if ((svr & ~VT_VALMASK) == VT_LVAL && svrv < VT_CONST) {
+    if (svr == (VT_CONST | VT_LVAL)) {
+        arm64_sym(30, sv->sym, // use x30 for address
+	          arm64_check_offset(0, arm64_type_size(svtt), sv->c.i));
         if (IS_FREG(r))
-            arm64_ldrv(arm64_type_size(svtt), fltr(r), intr(svrv), 0);
+            arm64_ldrv(arm64_type_size(svtt), fltr(r), 30,
+		       arm64_check_offset(1, arm64_type_size(svtt), sv->c.i));
         else
-            arm64_ldrx(!(svtt & VT_UNSIGNED), arm64_type_size(svtt),
-                       intr(r), intr(svrv), 0);
+            arm64_ldrx(!(svtt&VT_UNSIGNED), arm64_type_size(svtt), intr(r), 30,
+		       arm64_check_offset(1, arm64_type_size(svtt), sv->c.i));
+        return;
+    }
+
+    if ((svr & ~VT_VALMASK) == VT_LVAL && svrv < VT_CONST) {
+        if ((svtt & VT_BTYPE) != VT_VOID) {
+            if (IS_FREG(r))
+                arm64_ldrv(arm64_type_size(svtt), fltr(r), intr(svrv), 0);
+            else
+                arm64_ldrx(!(svtt & VT_UNSIGNED), arm64_type_size(svtt),
+                           intr(r), intr(svrv), 0);
+        }
         return;
     }
 
     if (svr == (VT_CONST | VT_LVAL | VT_SYM)) {
-        arm64_sym(30, sv->sym, svcul); // use x30 for address
+        arm64_sym(30, sv->sym, // use x30 for address
+		  arm64_check_offset(0, arm64_type_size(svtt), svcul));
         if (IS_FREG(r))
-            arm64_ldrv(arm64_type_size(svtt), fltr(r), 30, 0);
+            arm64_ldrv(arm64_type_size(svtt), fltr(r), 30,
+		       arm64_check_offset(1, arm64_type_size(svtt), svcul));
         else
-            arm64_ldrx(!(svtt & VT_UNSIGNED), arm64_type_size(svtt),
-                       intr(r), 30, 0);
+            arm64_ldrx(!(svtt&VT_UNSIGNED), arm64_type_size(svtt), intr(r), 30,
+		       arm64_check_offset(1, arm64_type_size(svtt), svcul));
         return;
     }
 
@@ -554,7 +594,7 @@ ST_FUNC void load(int r, SValue *sv)
 ST_FUNC void store(int r, SValue *sv)
 {
     int svtt = sv->type.t;
-    int svr = sv->r;
+    int svr = sv->r & ~VT_BOUNDED;
     int svrv = svr & VT_VALMASK;
     uint64_t svcul = (uint32_t)sv->c.i;
     svcul = svcul >> 31 & 1 ? svcul - ((uint64_t)1 << 32) : svcul;
@@ -567,6 +607,18 @@ ST_FUNC void store(int r, SValue *sv)
         return;
     }
 
+    if (svr == (VT_CONST | VT_LVAL)) {
+        arm64_sym(30, sv->sym, // use x30 for address
+		  arm64_check_offset(0, arm64_type_size(svtt), sv->c.i));
+        if (IS_FREG(r))
+            arm64_strv(arm64_type_size(svtt), fltr(r), 30,
+		       arm64_check_offset(1, arm64_type_size(svtt), sv->c.i));
+        else
+            arm64_strx(arm64_type_size(svtt), intr(r), 30,
+		       arm64_check_offset(1, arm64_type_size(svtt), sv->c.i));
+        return;
+    }
+
     if ((svr & ~VT_VALMASK) == VT_LVAL && svrv < VT_CONST) {
         if (IS_FREG(r))
             arm64_strv(arm64_type_size(svtt), fltr(r), intr(svrv), 0);
@@ -576,11 +628,14 @@ ST_FUNC void store(int r, SValue *sv)
     }
 
     if (svr == (VT_CONST | VT_LVAL | VT_SYM)) {
-        arm64_sym(30, sv->sym, svcul); // use x30 for address
+        arm64_sym(30, sv->sym, // use x30 for address
+		  arm64_check_offset(0, arm64_type_size(svtt), svcul));
         if (IS_FREG(r))
-            arm64_strv(arm64_type_size(svtt), fltr(r), 30, 0);
+            arm64_strv(arm64_type_size(svtt), fltr(r), 30,
+		       arm64_check_offset(1, arm64_type_size(svtt), svcul));
         else
-            arm64_strx(arm64_type_size(svtt), intr(r), 30, 0);
+            arm64_strx(arm64_type_size(svtt), intr(r), 30,
+		       arm64_check_offset(1, arm64_type_size(svtt), svcul));
         return;
     }
 
@@ -591,13 +646,81 @@ ST_FUNC void store(int r, SValue *sv)
 static void arm64_gen_bl_or_b(int b)
 {
     if ((vtop->r & (VT_VALMASK | VT_LVAL)) == VT_CONST && (vtop->r & VT_SYM)) {
-        assert(!b);
-	greloca(cur_text_section, vtop->sym, ind, R_AARCH64_CALL26, 0);
-	o(0x94000000); // bl .
+	greloca(cur_text_section, vtop->sym, ind,
+                b ? R_AARCH64_JUMP26 :  R_AARCH64_CALL26, 0);
+	o(0x14000000 | (uint32_t)!b << 31); // b/bl .
     }
-    else
+    else {
+#ifdef CONFIG_TCC_BCHECK
+        vtop->r &= ~VT_MUSTBOUND;
+#endif
         o(0xd61f0000 | (uint32_t)!b << 21 | intr(gv(RC_R30)) << 5); // br/blr
+    }
 }
+
+#if defined(CONFIG_TCC_BCHECK)
+
+static void gen_bounds_call(int v)
+{
+    Sym *sym = external_global_sym(v, &func_old_type);
+
+    greloca(cur_text_section, sym, ind, R_AARCH64_CALL26, 0);
+    o(0x94000000); // bl
+}
+
+static void gen_bounds_prolog(void)
+{
+    /* leave some room for bound checking code */
+    func_bound_offset = lbounds_section->data_offset;
+    func_bound_ind = ind;
+    func_bound_add_epilog = 0;
+    o(0xd503201f);  /* nop -> mov x0, lbound section pointer */
+    o(0xd503201f);
+    o(0xd503201f);
+    o(0xd503201f);  /* nop -> call __bound_local_new */
+}
+
+static void gen_bounds_epilog(void)
+{
+    addr_t saved_ind;
+    addr_t *bounds_ptr;
+    Sym *sym_data;
+    int offset_modified = func_bound_offset != lbounds_section->data_offset;
+
+    if (!offset_modified && !func_bound_add_epilog)
+        return;
+
+    /* add end of table info */
+    bounds_ptr = section_ptr_add(lbounds_section, sizeof(addr_t));
+    *bounds_ptr = 0;
+
+    sym_data = get_sym_ref(&char_pointer_type, lbounds_section,
+                           func_bound_offset, lbounds_section->data_offset);
+
+    /* generate bound local allocation */
+    if (offset_modified) {
+        saved_ind = ind;
+        ind = func_bound_ind;
+        greloca(cur_text_section, sym_data, ind, R_AARCH64_ADR_GOT_PAGE, 0);
+        o(0x90000000 | 0);            // adrp x0, #sym_data
+        greloca(cur_text_section, sym_data, ind, R_AARCH64_LD64_GOT_LO12_NC, 0);
+        o(0xf9400000 | 0 | (0 << 5)); // ld x0,[x0, #sym_data]
+        gen_bounds_call(TOK___bound_local_new);
+        ind = saved_ind;
+    }
+
+    /* generate bound check local freeing */
+    o(0xf81f0fe0); /* str x0, [sp, #-16]! */
+    o(0x3c9f0fe0); /* str q0, [sp, #-16]! */
+    greloca(cur_text_section, sym_data, ind, R_AARCH64_ADR_GOT_PAGE, 0);
+    o(0x90000000 | 0);            // adrp x0, #sym_data
+    greloca(cur_text_section, sym_data, ind, R_AARCH64_LD64_GOT_LO12_NC, 0);
+    o(0xf9400000 | 0 | (0 << 5)); // ld x0,[x0, #sym_data]
+    gen_bounds_call(TOK___bound_local_delete);
+    o(0x3cc107e0); /* ldr q0, [sp], #16 */
+    o(0xf84107e0); /* ldr x0, [sp], #16 */
+}
+#endif
 
 static int arm64_hfa_aux(CType *type, int *fsize, int num)
 {
@@ -642,7 +765,7 @@ static int arm64_hfa_aux(CType *type, int *fsize, int num)
             return num;
         }
     }
-    else if (type->t & VT_ARRAY) {
+    else if ((type->t & VT_ARRAY) && ((type->t & VT_BTYPE) != VT_PTR)) {
         int num1;
         if (!type->ref->c)
             return num;
@@ -657,9 +780,10 @@ static int arm64_hfa_aux(CType *type, int *fsize, int num)
     return -1;
 }
 
-static int arm64_hfa(CType *type, int *fsize)
+static int arm64_hfa(CType *type, unsigned *fsize)
 {
-    if ((type->t & VT_BTYPE) == VT_STRUCT || (type->t & VT_ARRAY)) {
+    if ((type->t & VT_BTYPE) == VT_STRUCT ||
+        ((type->t & VT_ARRAY) && ((type->t & VT_BTYPE) != VT_PTR))) {
         int sz = 0;
         int n = arm64_hfa_aux(type, &sz, 0);
         if (0 < n && n <= 4) {
@@ -839,6 +963,11 @@ ST_FUNC void gfunc_call(int nb_args)
     unsigned long stack;
     int i;
 
+#ifdef CONFIG_TCC_BCHECK
+    if (tcc_state->do_bounds_check)
+        gbound_args(nb_args);
+#endif
+
     return_type = &vtop[-nb_args].type.ref->type;
     if ((return_type->t & VT_BTYPE) == VT_STRUCT)
         --nb_args;
@@ -866,9 +995,12 @@ ST_FUNC void gfunc_call(int nb_args)
 
     stack = (stack + 15) >> 4 << 4;
 
-    assert(stack < 0x1000);
-    if (stack)
-        o(0xd10003ff | stack << 10); // sub sp,sp,#(n)
+    if (stack >= 0x1000000) // 16Mb
+        tcc_error("stack size too big %lu", stack);
+    if (stack & 0xfff)
+        o(0xd10003ff | (stack & 0xfff) << 10); // sub sp,sp,#(n)
+    if (stack >> 12)
+            o(0xd14003ff | (stack >> 12) << 10);
 
     // First pass: set all values on stack
     for (i = nb_args; i; i--) {
@@ -961,8 +1093,10 @@ ST_FUNC void gfunc_call(int nb_args)
     save_regs(0);
     arm64_gen_bl_or_b(0);
     --vtop;
-    if (stack)
-        o(0x910003ff | stack << 10); // add sp,sp,#(n)
+    if (stack & 0xfff)
+        o(0x910003ff | (stack & 0xfff) << 10); // add sp,sp,#(n)
+    if (stack >> 12)
+        o(0x914003ff | (stack >> 12) << 10);
 
     {
         int rt = return_type->t;
@@ -1014,8 +1148,8 @@ ST_FUNC void gfunc_prolog(Sym *func_sym)
 
     for (sym = func_type->ref; sym; sym = sym->next)
         ++n;
-    t = tcc_malloc(n * sizeof(*t));
-    a = tcc_malloc(n * sizeof(*a));
+    t = n ? tcc_malloc(n * sizeof(*t)) : NULL;
+    a = n ? tcc_malloc(n * sizeof(*a)) : NULL;
 
     for (sym = func_type->ref; sym; sym = sym->next)
         t[i++] = &sym->type;
@@ -1076,6 +1210,10 @@ ST_FUNC void gfunc_prolog(Sym *func_sym)
     o(0xd503201f); // nop
     o(0xd503201f); // nop
     loc = 0;
+#ifdef CONFIG_TCC_BCHECK
+    if (tcc_state->do_bounds_check)
+        gen_bounds_prolog();
+#endif
 }
 
 ST_FUNC void gen_va_start(void)
@@ -1117,7 +1255,7 @@ ST_FUNC void gen_va_start(void)
 ST_FUNC void gen_va_arg(CType *t)
 {
     int align, size = type_size(t, &align);
-    int fsize, hfa = arm64_hfa(t, &fsize);
+    unsigned fsize, hfa = arm64_hfa(t, &fsize);
     uint32_t r0, r1;
 
     if (is_float(t->t)) {
@@ -1246,6 +1384,11 @@ ST_FUNC void gfunc_return(CType *func_type)
 
 ST_FUNC void gfunc_epilog(void)
 {
+#ifdef CONFIG_TCC_BCHECK
+    if (tcc_state->do_bounds_check)
+        gen_bounds_epilog();
+#endif
+
     if (loc) {
         // Insert instructions to subtract size of stack frame from SP.
         unsigned char *ptr = cur_text_section->data + arm64_func_sub_sp_offset;
@@ -1454,8 +1597,11 @@ static int arm64_gen_opic(int op, uint32_t l, int rev, uint64_t val,
         val = val & (n - 1);
         if (rev)
             return 0;
-        if (!val)
-            assert(0);
+        if (!val) {
+            // tcc_warning("shift count >= width of type");
+            o(0x2a0003e0 | l << 31 | a << 16);
+            return 1;
+        }
         else if (op == TOK_SHL)
             o(0x53000000 | l << 31 | l << 22 | x | a << 5 |
               (n - val) << 16 | (n - 1 - val) << 10); // lsl
@@ -1892,11 +2038,28 @@ ST_FUNC void gen_vla_sp_restore(int addr) {
 }
 
 ST_FUNC void gen_vla_alloc(CType *type, int align) {
-    uint32_t r = intr(gv(RC_INT));
+    uint32_t r;
+#if defined(CONFIG_TCC_BCHECK)
+    if (tcc_state->do_bounds_check)
+        vpushv(vtop);
+#endif
+    r = intr(gv(RC_INT));
     o(0x91003c00 | r | r << 5); // add x(r),x(r),#15
     o(0x927cec00 | r | r << 5); // bic x(r),x(r),#15
     o(0xcb2063ff | r << 16); // sub sp,sp,x(r)
     vpop();
+#if defined(CONFIG_TCC_BCHECK)
+    if (tcc_state->do_bounds_check) {
+        vpushi(0);
+        vtop->r = TREG_R(0);
+        o(0x910003e0 | vtop->r); // mov r0,sp
+        vswap();
+        vpush_global_sym(&func_old_type, TOK___bound_new_region);
+        vrott(3);
+        gfunc_call(2);
+        func_bound_add_epilog = 1;
+    }
+#endif
 }
 
 /* end of A64 code generator */

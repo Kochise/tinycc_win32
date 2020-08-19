@@ -861,7 +861,7 @@ static void pe_build_imports(struct pe_info *pe)
                         v = (ADDR3264)GetProcAddress(dllref->handle, ordinal?(char*)0+ordinal:name);
                     }
                     if (!v)
-                        tcc_error_noabort("can't build symbol '%s'", name);
+                        tcc_error_noabort("could not resolve symbol '%s'", name);
                 } else
 #endif
                 if (ordinal) {
@@ -1891,6 +1891,7 @@ static void pe_add_runtime(TCCState *s1, struct pe_info *pe)
                 : (unicode_entry ? "__wstart" : "__start")
         ;
 
+    pe->start_symbol = start_symbol + 1;
     if (!s1->leading_underscore || strchr(start_symbol, '@'))
         ++start_symbol;
 
@@ -1937,7 +1938,6 @@ static void pe_add_runtime(TCCState *s1, struct pe_info *pe)
     if (TCC_OUTPUT_MEMORY == s1->output_type)
         pe_type = PE_RUN;
     pe->type = pe_type;
-    pe->start_symbol = start_symbol;
 }
 
 static void pe_set_options(TCCState * s1, struct pe_info *pe)
@@ -1996,6 +1996,7 @@ ST_FUNC int pe_output_file(TCCState *s1, const char *filename)
     memset(&pe, 0, sizeof pe);
     pe.filename = filename;
     pe.s1 = s1;
+    s1->filetype = 0;
 
 #ifdef CONFIG_TCC_BCHECK
     tcc_add_bcheck(s1);
@@ -2019,8 +2020,7 @@ ST_FUNC int pe_output_file(TCCState *s1, const char *filename)
             }
         }
         pe.start_addr = (DWORD)
-            ((uintptr_t)tcc_get_symbol_err(s1, pe.start_symbol)
-                - pe.imagebase);
+            (get_sym_addr(s1, pe.start_symbol, 1, 1) - pe.imagebase);
         if (s1->nb_errors)
             ret = -1;
         else
