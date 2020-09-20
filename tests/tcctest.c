@@ -1737,6 +1737,16 @@ int sinit23[2] = { "astring" ? sizeof("astring") : -1,
 
 int sinit24 = 2 || 1 / 0; /* exception in constant but unevaluated context */
 
+/* bitfield init */
+struct bf_SS {unsigned int bit:1,bits31:31; };
+struct bf_SS bf_init = { .bit = 1 };
+struct bfn_SS {int a,b; struct bf_SS c; int d,e; };
+struct bfn_SS bfn_init = { .c.bit = 1 };
+struct bfa_SS {int a,b; struct bf_SS c[3]; int d,e; };
+struct bfa_SS bfa_init = { .c[1].bit = 1 };
+struct bf_SS bfaa_init[3] = { [1].bit = 1 };
+struct bf_SS bfaa_vinit[] = { [2].bit = 1 };
+
 extern int external_inited = 42;
 
 void init_test(void)
@@ -1756,6 +1766,11 @@ void init_test(void)
     int zero = 0;
     /* Addresses on non-weak symbols are non-zero, but not the access itself */
     int linit18[2] = {&zero ? 1 : -1, zero ? -1 : 1 };
+    struct bf_SS bf_finit = { .bit = 1 };
+    struct bfn_SS bfn_finit = { .c.bit = 1 };
+    struct bfa_SS bfa_finit = { .c[1].bit = 1 };
+    struct bf_SS bfaa_finit[3] = { [1].bit = 1 };
+    struct bf_SS bfaa_fvinit[] = { [2].bit = 1 };
     
     printf("sinit1=%d\n", sinit1);
     printf("sinit2=%d\n", sinit2);
@@ -1851,6 +1866,22 @@ void init_test(void)
     printf("sinit23= %d %d\n", sinit23[0], sinit23[1]);
     printf("sinit24=%d\n", sinit24);
     printf("linit18= %d %d\n", linit18[0], linit18[1]);
+    printf ("bf1: %u %u\n", bf_init.bit, bf_init.bits31);
+    printf ("bf2: %u %u\n", bf_finit.bit, bf_finit.bits31);
+    printf ("bf3: %u %u\n", bfn_init.c.bit, bfn_init.c.bits31);
+    printf ("bf4: %u %u\n", bfn_finit.c.bit, bfn_finit.c.bits31);
+    for (i = 0; i < 3; i++)
+        printf ("bf5[%d]: %u %u\n", i, bfa_init.c[i].bit, bfa_init.c[i].bits31);
+    for (i = 0; i < 3; i++)
+        printf ("bf6[%d]: %u %u\n", i, bfa_finit.c[i].bit, bfa_finit.c[i].bits31);
+    for (i = 0; i < 3; i++)
+        printf ("bf7[%d]: %u %u\n", i, bfaa_init[i].bit, bfaa_init[i].bits31);
+    for (i = 0; i < 3; i++)
+        printf ("bf8[%d]: %u %u\n", i, bfaa_finit[i].bit, bfaa_finit[i].bits31);
+    for (i = 0; i < 3; i++)
+        printf ("bf9[%d]: %u %u\n", i, bfaa_vinit[i].bit, bfaa_vinit[i].bits31);
+    for (i = 0; i < 3; i++)
+        printf ("bf10[%d]: %u %u\n", i, bfaa_fvinit[i].bit, bfaa_fvinit[i].bits31);
 }
 
 void switch_uc(unsigned char uc)
@@ -2627,18 +2658,34 @@ void vprintf1(const char *fmt, ...)
 struct myspace {
     short int profile;
 };
+struct myspace2 {
+    char a[0];
+};
+struct myspace3 {
+    char a[1];
+};
+struct myspace4 {
+    char a[2];
+};
 
 void stdarg_for_struct(struct myspace bob, ...)
 {
     struct myspace george, bill;
+    struct myspace2 alex1;
+    struct myspace3 alex2;
+    struct myspace4 alex3;
     va_list ap;
     short int validate;
 
     va_start(ap, bob);
+    alex1    = va_arg(ap, struct myspace2);
+    alex2    = va_arg(ap, struct myspace3);
+    alex3    = va_arg(ap, struct myspace4);
     bill     = va_arg(ap, struct myspace);
     george   = va_arg(ap, struct myspace);
     validate = va_arg(ap, int);
-    printf("stdarg_for_struct: %d %d %d %d\n",
+    printf("stdarg_for_struct: %d %d %d %d %d %d %d\n",
+           alex2.a[0], alex3.a[0], alex3.a[1],
            bob.profile, bill.profile, george.profile, validate);
     va_end(ap);
 }
@@ -2664,10 +2711,40 @@ void stdarg_syntax(int n, ...)
     (va_end(ap));
 }
 
+typedef struct{
+    double x,y;
+} point;
+point pts[]={{1.0,2.0},{3.0,4.0},{5.0,6.0},{7.0,8.0},{9.0,10.0},{11.0,12.0}};
+
+static void stdarg_double_struct(int nargs, int posd,...)
+{
+    int i;
+    double d;
+    point pi;
+    va_list args;
+
+    printf ("stdarg_double_struct: %d\n", posd);
+    va_start(args,posd);
+    for(i = 0; i < nargs; i++) {
+        if (i == posd) {
+            d = va_arg (args, double);
+            printf ("d %d = %g\n", i, d);
+        }
+        else {
+            pi = va_arg (args, point);
+            printf ("pts[%d] = %g %g\n", i, pi.x, pi.y);
+        }
+    }
+    va_end(args);
+}
+
 void stdarg_test(void)
 {
     LONG_DOUBLE ld = 1234567891234LL;
     struct myspace bob;
+    struct myspace2 bob2;
+    struct myspace3 bob3;
+    struct myspace4 bob4;
 
     vprintf1("%d %d %d\n", 1, 2, 3);
     vprintf1("%f %d %f\n", 1.0, 2, 3.0);
@@ -2709,9 +2786,20 @@ void stdarg_test(void)
              42.0, 43.0, ld);
 
     bob.profile = 42;
-    stdarg_for_struct(bob, bob, bob, bob.profile);
+    bob3.a[0] = 1;
+    bob4.a[0] = 2;
+    bob4.a[1] = 3;
+    stdarg_for_struct(bob, bob2, bob3, bob4, bob, bob, bob.profile);
     stdarg_for_libc("stdarg_for_libc: %s %.2f %d\n", "string", 1.23, 456);
     stdarg_syntax(1, 17);
+#ifndef __riscv
+    stdarg_double_struct(6,-1,pts[0],pts[1],pts[2],pts[3],pts[4],pts[5]);
+    stdarg_double_struct(7,1,pts[0],-1.0,pts[1],pts[2],pts[3],pts[4],pts[5]);
+    stdarg_double_struct(7,2,pts[0],pts[1],-1.0,pts[2],pts[3],pts[4],pts[5]);
+    stdarg_double_struct(7,3,pts[0],pts[1],pts[2],-1.0,pts[3],pts[4],pts[5]);
+    stdarg_double_struct(7,4,pts[0],pts[1],pts[2],pts[3],-1.0,pts[4],pts[5]);
+    stdarg_double_struct(7,5,pts[0],pts[1],pts[2],pts[3],pts[4],-1.0,pts[5]);
+#endif
 }
 
 int reltab[3] = { 1, 2, 3 };
@@ -3137,8 +3225,16 @@ static __inline__ void sigdelset1(unsigned int *set, int _sig)
 	asm("btrl %1,%0" : "=m"(*set) : "Ir"(_sig - 1) : "cc", "flags");
 }
 
-#ifndef __APPLE__
+#ifdef __clang__
 /* clang's inline asm is uncapable of 'xchgb %b0,%h0' */
+static __inline__ __const__ unsigned int swab32(unsigned int x)
+{
+        return ((x >> 24) & 0xff) |
+               ((x >> 8) & 0xff00) |
+               ((x << 8) & 0xff0000) |
+               ((x << 24) & 0xff000000);
+}
+#else
 static __inline__ __const__ unsigned int swab32(unsigned int x)
 {
 	__asm__("xchgb %b0,%h0\n\t"	/* swap lower bytes	*/
@@ -3559,9 +3655,7 @@ void asm_test(void)
     __asm__("btsl %1,%0" : "=m"(set) : "Ir"(20) : "cc");
     printf("set=0x%x\n", set);
     val = 0x01020304;
-#ifndef __APPLE__
     printf("swab32(0x%08x) = 0x%0x\n", val, swab32(val));
-#endif
 #ifndef _WIN32
 #ifndef __APPLE__
     override_func1();
@@ -3624,6 +3718,8 @@ void asm_test(void)
 
 int constant_p_var;
 
+int func(void);
+
 void builtin_test(void)
 {
     short s;
@@ -3662,6 +3758,8 @@ void builtin_test(void)
 #else
     printf("res8 = %d\n", __builtin_constant_p(i && 0 ? i : 34));
 #endif
+    printf("res9 = %d\n", __builtin_constant_p("hi"));
+    printf("res10 = %d\n", __builtin_constant_p(func()));
     s = 1;
     ll = 2;
     i = __builtin_choose_expr (1 != 0, ll, s);

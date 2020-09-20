@@ -187,8 +187,8 @@ extern long double strtold (const char *__nptr, char **__endptr);
 #if defined TCC_IS_NATIVE && !defined CONFIG_TCCBOOT
 # define CONFIG_TCC_BACKTRACE
 # if (defined TCC_TARGET_I386 || defined TCC_TARGET_X86_64 || \
-      defined TCC_TARGET_ARM || defined TCC_TARGET_ARM64) || \
-      defined TCC_TARGET_RISCV64 \
+      defined TCC_TARGET_ARM || defined TCC_TARGET_ARM64 || \
+      defined TCC_TARGET_RISCV64) \
   && !defined TCC_UCLIBC && !defined TCC_MUSL
 # define CONFIG_TCC_BCHECK /* enable bound checking code */
 # endif
@@ -505,8 +505,7 @@ struct FuncAttr {
     func_dtor   : 1, /* attribute((destructor)) */
     func_args   : 8, /* PE __stdcall args */
     func_alwinl : 1, /* always_inline */
-    no_bcheck   : 1, /* no bound checking */
-    xxxx        :14;
+    xxxx        : 15;
 };
 
 /* symbol management */

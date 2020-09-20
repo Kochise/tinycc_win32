@@ -4,44 +4,34 @@
 #include <signal.h>
 #include <string.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 #include <unistd.h>
+#include <stdlib.h>
 #include <errno.h>
 #include <setjmp.h>
 
-/* See tcc-doc.info */
-#if defined(__TINYC__) && __BOUNDS_CHECKING_ON
-#undef __attribute__
-extern void __bound_checking (int no_check);
-#define BOUNDS_CHECKING_OFF __bound_checking(1)
-#define BOUNDS_CHECKING_ON  __bound_checking(-1)
-#define BOUNDS_NO_CHECKING __attribute__((bound_no_checking))
-#else
-#define BOUNDS_CHECKING_OFF
-#define BOUNDS_CHECKING_ON
-#define BOUNDS_NO_CHECKING
-#endif
-
 static volatile int run = 1;
-static int dummy[10];
 static sem_t sem;
+static sem_t sem_child;
 
 static void
-add (void) BOUNDS_NO_CHECKING
+add (int n)
 {
     int i;
+    int arr[n];
 
-    for (i = 0; i < (sizeof(dummy)/sizeof(dummy[0])); i++) {
-        dummy[i]++;
+    for (i = 0; i < n; i++) {
+        arr[i]++;
     }
-    /* Should not be translated into __bound_memset */
-    memset (&dummy[0], 0, sizeof(dummy));
+    memset (&arr[0], 0, n * sizeof(int));
 }
 
 static void *
 high_load (void *unused)
 {
     while (run) {
-        add();
+        add(10);
+        add(20);
     }
     return NULL;
 }
@@ -56,17 +46,48 @@ do_signal (void *unused)
     return NULL;
 }
 
-static void signal_handler(int sig) BOUNDS_NO_CHECKING
+static void *
+do_fork (void *unused)
 {
-    add();
+    pid_t pid;
+
+    while (run) {
+        switch ((pid = fork())) {
+        case 0:
+            add(1000);
+            add(2000);
+            exit(0);
+            break;
+        case -1:
+            return NULL;
+        default:
+            while (sem_wait(&sem_child) < 0 && errno == EINTR);
+            wait(NULL);
+            break;
+        }
+    }
+    return NULL;
+}
+
+static void signal_handler(int sig)
+{
+    add(10);
+    add(20);
     sem_post (&sem);
+}
+
+static void child_handler(int sig)
+{
+    add(10);
+    add(20);
+    sem_post (&sem_child);
 }
 
 int
 main (void)
 {
     int i;
-    pthread_t id1, id2;
+    pthread_t id1, id2, id3;
     struct sigaction act;
     sigjmp_buf sj;
     sigset_t m;
@@ -77,21 +98,29 @@ main (void)
     act.sa_flags = 0;
     sigemptyset (&act.sa_mask);
     sigaction (SIGUSR1, &act, NULL);
+    act.sa_handler = child_handler;
+    sigaction (SIGCHLD, &act, NULL);
 
-    sem_init (&sem, 1, 0);
+    printf ("start\n"); fflush(stdout);
+
+    sem_init (&sem, 0, 0);
+    sem_init (&sem_child, 0, 0);
     pthread_create(&id1, NULL, high_load, NULL);
     pthread_create(&id2, NULL, do_signal, NULL);
+    pthread_create(&id3, NULL, do_fork, NULL);
 
-    printf ("start\n");
     /* sleep does not work !!! */
     end = time(NULL) + 2;
     while (time(NULL) < end) ;
     run = 0;
-    printf ("end\n");
+
+    printf ("end\n"); fflush(stdout);
 
     pthread_join(id1, NULL);
     pthread_join(id2, NULL);
+    pthread_join(id3, NULL);
     sem_destroy (&sem);
+    sem_destroy (&sem_child);
 
     sigemptyset (&m);
     sigprocmask (SIG_SETMASK, &m, NULL);

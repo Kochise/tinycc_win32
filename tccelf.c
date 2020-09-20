@@ -1318,11 +1318,11 @@ static void add_init_array_defines(TCCState *s1, const char *section_name)
 }
 
 #ifndef TCC_TARGET_PE
-static int tcc_add_support(TCCState *s1, const char *filename)
+static void tcc_add_support(TCCState *s1, const char *filename)
 {
     char buf[1024];
     snprintf(buf, sizeof(buf), "%s/%s", s1->tcc_lib_path, filename);
-    return tcc_add_file(s1, buf);
+    tcc_add_file(s1, buf);
 }
 #endif
 
@@ -1457,7 +1457,8 @@ ST_FUNC void tcc_add_runtime(TCCState *s1)
                 tcc_add_btstub(s1);
         }
 #endif
-        tcc_add_support(s1, TCC_LIBTCC1);
+        if (strlen(TCC_LIBTCC1) > 0)
+            tcc_add_support(s1, TCC_LIBTCC1);
 #ifndef TCC_TARGET_MACHO
         /* add crt end if not memory output */
         if (s1->output_type != TCC_OUTPUT_MEMORY)
@@ -1876,13 +1877,13 @@ static int layout_sections(TCCState *s1, ElfW(Phdr) *phdr, int phnum,
         dyninf->bss_addr = dyninf->bss_size = 0;
 #endif
 
-        for(j = 0; j < 2; j++) {
-            ph->p_type = PT_LOAD;
+        for(j = 0; j < (phnum == 6 ? 3 : 2); j++) {
+            ph->p_type = j == 2 ? PT_TLS : PT_LOAD;
             if (j == 0)
                 ph->p_flags = PF_R | PF_X;
             else
                 ph->p_flags = PF_R | PF_W;
-            ph->p_align = s_align;
+            ph->p_align = j == 2 ? 4 : s_align;
 
             /* Decide the layout of sections loaded in memory. This must
                be done before program headers are filled since they contain
@@ -1894,12 +1895,16 @@ static int layout_sections(TCCState *s1, ElfW(Phdr) *phdr, int phnum,
                     s = s1->sections[i];
                     /* compute if section should be included */
                     if (j == 0) {
-                        if ((s->sh_flags & (SHF_ALLOC | SHF_WRITE)) !=
+                        if ((s->sh_flags & (SHF_ALLOC | SHF_WRITE | SHF_TLS)) !=
                             SHF_ALLOC)
                             continue;
-                    } else {
-                        if ((s->sh_flags & (SHF_ALLOC | SHF_WRITE)) !=
+                    } else if (j == 1) {
+                        if ((s->sh_flags & (SHF_ALLOC | SHF_WRITE | SHF_TLS)) !=
                             (SHF_ALLOC | SHF_WRITE))
+                            continue;
+                    } else  {
+                        if ((s->sh_flags & (SHF_ALLOC | SHF_WRITE | SHF_TLS)) !=
+                            (SHF_ALLOC | SHF_WRITE | SHF_TLS))
                             continue;
                     }
                     if (s == interp) {
@@ -2343,7 +2348,7 @@ static void tidy_section_headers(TCCState *s1, int *sec_order)
     for_each_elem(symtab_section, 1, sym, ElfW(Sym))
 	if (sym->st_shndx != SHN_UNDEF && sym->st_shndx < SHN_LORESERVE)
 	    sym->st_shndx = backmap[sym->st_shndx];
-    if( !s1->static_link ) {
+    if ( !s1->static_link ) {
         for_each_elem(s1->dynsym, 1, sym, ElfW(Sym))
 	    if (sym->st_shndx != SHN_UNDEF && sym->st_shndx < SHN_LORESERVE)
 	        sym->st_shndx = backmap[sym->st_shndx];
@@ -2511,8 +2516,12 @@ static int elf_output_file(TCCState *s1, const char *filename)
         phnum = 3;
     else if (s1->static_link)
         phnum = 2;
-    else
-        phnum = 5;
+    else {
+        int i;
+        for (i = 1; i < s1->nb_sections &&
+                    !(s1->sections[i]->sh_flags & SHF_TLS); i++);
+        phnum = i < s1->nb_sections ? 6 : 5;
+    }
 
     /* allocate program segment headers */
     phdr = tcc_mallocz(phnum * sizeof(ElfW(Phdr)));

@@ -825,7 +825,7 @@ static void pe_build_imports(struct pe_info *pe)
 
         dllindex = p->dll_index;
         if (dllindex)
-            name = (dllref = pe->s1->loaded_dlls[dllindex-1])->name;
+            name = tcc_basename((dllref = pe->s1->loaded_dlls[dllindex-1])->name);
         else
             name = "", dllref = NULL;
 
@@ -1763,7 +1763,7 @@ static int pe_load_dll(TCCState *s1, const char *filename)
     if (ret) {
         return -1;
     } else if (p) {
-        index = add_dllref(s1, tcc_basename(filename));
+        index = add_dllref(s1, filename);
         for (q = p; *q; q += 1 + strlen(q))
             pe_putimport(s1, index, q, 0);
         tcc_free(p);
@@ -1862,34 +1862,34 @@ static void tcc_add_support(TCCState *s1, const char *filename)
 static void pe_add_runtime(TCCState *s1, struct pe_info *pe)
 {
     const char *start_symbol;
-    int pe_type = 0;
-    int unicode_entry = 0;
+    int pe_type;
 
-    if (find_elf_sym(symtab_section, PE_STDSYM("WinMain","@16")))
-        pe_type = PE_GUI;
-    else
-    if (find_elf_sym(symtab_section, PE_STDSYM("wWinMain","@16"))) {
-        pe_type = PE_GUI;
-        unicode_entry = PE_GUI;
-    }
-    else
     if (TCC_OUTPUT_DLL == s1->output_type) {
         pe_type = PE_DLL;
-    }
-    else {
-        pe_type = PE_EXE;
-        if (find_elf_sym(symtab_section, "wmain"))
-            unicode_entry = PE_EXE;
-    }
+        start_symbol = PE_STDSYM("__dllstart","@12");
+    } else {
+        const char *run_symbol;
+        if (find_elf_sym(symtab_section, PE_STDSYM("WinMain","@16"))) {
+            start_symbol = "__winstart";
+            run_symbol = "__runwinmain";
+            pe_type = PE_GUI;
+        } else if (find_elf_sym(symtab_section, PE_STDSYM("wWinMain","@16"))) {
+            start_symbol = "__wwinstart";
+            run_symbol = "__runwwinmain";
+            pe_type = PE_GUI;
+        } else if (find_elf_sym(symtab_section, "wmain")) {
+            start_symbol = "__wstart";
+            run_symbol = "__runwmain";
+            pe_type = PE_EXE;
+        } else {
+            start_symbol =  "__start";
+            run_symbol = "__runmain";
+            pe_type = PE_EXE;
 
-    start_symbol =
-        TCC_OUTPUT_MEMORY == s1->output_type
-        ? PE_GUI == pe_type ? (unicode_entry ? "__runwwinmain" : "__runwinmain")
-            : (unicode_entry ? "__runwmain" : "__runmain")
-        : PE_DLL == pe_type ? PE_STDSYM("__dllstart","@12")
-            : PE_GUI == pe_type ? (unicode_entry ? "__wwinstart": "__winstart")
-                : (unicode_entry ? "__wstart" : "__start")
-        ;
+        }
+        if (TCC_OUTPUT_MEMORY == s1->output_type)
+            start_symbol = run_symbol;
+    }
 
     pe->start_symbol = start_symbol + 1;
     if (!s1->leading_underscore || strchr(start_symbol, '@'))
@@ -1923,7 +1923,8 @@ static void pe_add_runtime(TCCState *s1, struct pe_info *pe)
             "msvcrt", "kernel32", "", "user32", "gdi32", NULL
         };
         const char **pp, *p;
-        tcc_add_support(s1, TCC_LIBTCC1);
+        if (strlen(TCC_LIBTCC1) > 0)
+            tcc_add_support(s1, TCC_LIBTCC1);
         for (pp = libs; 0 != (p = *pp); ++pp) {
             if (*p)
                 tcc_add_library_err(s1, p);
@@ -2046,3 +2047,4 @@ ST_FUNC int pe_output_file(TCCState *s1, const char *filename)
 }
 
 /* ------------------------------------------------------------- */
+

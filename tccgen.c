@@ -1501,8 +1501,6 @@ static void merge_funcattr(struct FuncAttr *fa, struct FuncAttr *fa1)
       fa->func_ctor = 1;
     if (fa1->func_dtor)
       fa->func_dtor = 1;
-    if (fa1->no_bcheck)
-      fa->no_bcheck = 1;
 }
 
 /* Merge attributes.  */
@@ -3571,7 +3569,7 @@ again:
             if (ds <= ss)
                 goto done;
             /* ss <= 4 here */
-            if (ds <= 4) {
+            if (ds <= 4 && !(dbt == (VT_SHORT | VT_UNSIGNED) && sbt == VT_BYTE)) {
                 gv(RC_INT);
                 goto done; /* no 64bit envolved */
             }
@@ -4124,12 +4122,6 @@ redo:
         case TOK_ALWAYS_INLINE2:
             ad->f.func_alwinl = 1;
             break;
-#ifdef CONFIG_TCC_BCHECK
-        case TOK_NO_BOUND_CHECK1:
-        case TOK_NO_BOUND_CHECK2:
-            ad->f.no_bcheck = 1;
-            break;
-#endif
         case TOK_SECTION1:
         case TOK_SECTION2:
             skip('(');
@@ -5709,7 +5701,8 @@ ST_FUNC void unary(void)
         break;
     case TOK_builtin_constant_p:
 	parse_builtin_params(1, "e");
-	n = (vtop->r & (VT_VALMASK | VT_LVAL | VT_SYM)) == VT_CONST;
+	n = (vtop->r & (VT_VALMASK | VT_LVAL)) == VT_CONST &&
+            !((vtop->r & VT_SYM) && vtop->sym->a.addrtaken);
 	vtop--;
 	vpushi(n);
         break;
@@ -5962,26 +5955,6 @@ special_math_val:
         if (t < TOK_UIDENT)
             expect("identifier");
         s = sym_find(t);
-#ifdef CONFIG_TCC_BCHECK
-        /* HACK to undo alias definition in tccpp.c
-           if function has no bound checking */
-        if (tcc_state->do_bounds_check == 0 && s &&
-            (s->type.t & VT_BTYPE) == VT_FUNC && (s->asm_label & SYM_FIELD)) {
-            const char *name = get_tok_str(s->asm_label & ~SYM_FIELD, NULL);
-
-            if (name && strncmp (name, "__bound_", strlen("__bound_")) == 0) {
-                char str[100];
-                int v = s->v;
-
-                sprintf (str, "!%s", name); /* illegal name */
-                t = tok_alloc(str, strlen(str))->tok;
-                s = sym_find(t);
-                if (s == NULL)
-                    s = external_global_sym(t, &func_old_type);
-                s->asm_label = v | SYM_FIELD; /* use old name as alias */
-            }
-        }
-#endif
         if (!s || IS_ASM_SYM(s)) {
             const char *name = get_tok_str(t, NULL);
             if (tok != '(')
@@ -7450,10 +7423,17 @@ static int decl_designator(CType *type, Section *sec, unsigned long c,
             c += f->c;
         }
     }
+
     /* must put zero in holes (note that doing it that way
        ensures that it even works with designators) */
-    if (!(flags & DIF_SIZE_ONLY) && c - corig > al)
-	init_putz(sec, corig + al, c - corig - al);
+    if (!(flags & DIF_SIZE_ONLY)) {
+        int zlen = c - (corig + al);
+        if (type->t & VT_BITFIELD) /* must include current field too */
+            zlen += type_size(type, &align);
+        if (zlen > 0)
+	    init_putz(sec, corig + al, zlen);
+    }
+
     decl_initializer(type, sec, c, flags & ~DIF_FIRST);
 
     /* XXX: make it more general */
@@ -8117,14 +8097,7 @@ static void decl_initializer_alloc(CType *type, AttributeDef *ad, int r,
    'cur_text_section' */
 static void gen_function(Sym *sym)
 {
-    /* Initialize VLA state */
     struct scope f = { 0 };
-#ifdef CONFIG_TCC_BCHECK
-    unsigned char save_bcheck = tcc_state->do_bounds_check;
-
-    if (sym->type.ref->f.no_bcheck)
-        tcc_state->do_bounds_check = 0;
-#endif
     cur_scope = root_scope = &f;
     nocode_wanted = 0;
     ind = cur_text_section->data_offset;
@@ -8178,9 +8151,6 @@ static void gen_function(Sym *sym)
     check_vstack();
     /* do this after funcend debug info */
     next();
-#ifdef CONFIG_TCC_BCHECK
-    tcc_state->do_bounds_check = save_bcheck;
-#endif
 }
 
 static void gen_inline_functions(TCCState *s)
