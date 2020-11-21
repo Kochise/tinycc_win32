@@ -74,6 +74,11 @@ GEN-ALWAYS =
 104_inline.test : FLAGS += $(subst 104,104+,$1)
 104_inline.test : GEN = $(GEN-TCC)
 
+# this test needs two files, and we want to invoke the linker
+120_alias.test : FLAGS += $(subst 120,120+,$1)
+120_alias.test : GEN = $(GEN-TCC)
+120_alias.test : NORUN = true
+
 # this test needs pthread
 106_pthread.test: FLAGS += -pthread
 106_pthread.test: NORUN = true
@@ -98,6 +103,8 @@ GEN-ALWAYS =
 115_bound_setjmp.test: FLAGS += -b
 116_bound_setjmp2.test: FLAGS += -b
 117_builtins.test: T1 = ( $(TCC) -run $1 && $(TCC) -b -run $1 )
+121_struct_return.test: FLAGS += -b
+122_vla_reuse.test: FLAGS += -b
 
 # Filter source directory in warnings/errors (out-of-tree builds)
 FILTER = 2>&1 | sed -e 's,$(SRC)/,,g'

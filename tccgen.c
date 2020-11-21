@@ -123,6 +123,12 @@ static struct scope {
     Sym *lstk, *llstk;
 } *cur_scope, *loop_scope, *root_scope;
 
+typedef struct {
+    Section *sec;
+    int local_offset;
+    Sym *flex_array_ref;
+} init_params;
+
 /********************************************************/
 /* stab debug support */
 
@@ -218,8 +224,8 @@ static int is_compatible_types(CType *type1, CType *type2);
 static int parse_btype(CType *type, AttributeDef *ad);
 static CType *type_decl(CType *type, AttributeDef *ad, int *v, int td);
 static void parse_expr_type(CType *type);
-static void init_putv(CType *type, Section *sec, unsigned long c);
-static void decl_initializer(CType *type, Section *sec, unsigned long c, int flags);
+static void init_putv(init_params *p, CType *type, unsigned long c);
+static void decl_initializer(init_params *p, CType *type, unsigned long c, int flags);
 static void block(int is_expr);
 static void decl_initializer_alloc(CType *type, AttributeDef *ad, int r, int has_init, int v, int scope);
 static void decl(int l);
@@ -413,7 +419,8 @@ ST_FUNC void tcc_debug_start(TCCState *s1)
         pstrcat(buf, sizeof(buf), "/");
         put_stabs_r(s1, buf, N_SO, 0, 0,
                     text_section->data_offset, text_section, section_sym);
-        put_stabs_r(s1, file->prev->filename, N_SO, 0, 0,
+        put_stabs_r(s1, file->prev ? file->prev->filename : file->filename,
+                    N_SO, 0, 0,
                     text_section->data_offset, text_section, section_sym);
         for (i = 0; i < sizeof (default_debug) / sizeof (default_debug[0]); i++)
             put_stabs(s1, default_debug[i].name, N_LSYM, 0, 0, 0);
@@ -496,7 +503,7 @@ static void tcc_get_debug_info(TCCState *s1, Sym *s, CString *result)
     CString str;
 
     for (;;) {
-        type = t->type.t & ~(VT_EXTERN | VT_STATIC | VT_CONSTANT | VT_VOLATILE);
+        type = t->type.t & ~(VT_STORAGE | VT_CONSTANT | VT_VOLATILE);
         if ((type & VT_BTYPE) != VT_BYTE)
             type &= ~VT_DEFSIGN;
         if (type == VT_PTR || type == (VT_PTR | VT_ARRAY))
@@ -586,7 +593,7 @@ static void tcc_get_debug_info(TCCState *s1, Sym *s, CString *result)
         cstr_printf (result, "%d=", ++debug_next_type);
     t = s;
     for (;;) {
-        type = t->type.t & ~(VT_EXTERN | VT_STATIC | VT_CONSTANT | VT_VOLATILE);
+        type = t->type.t & ~(VT_STORAGE | VT_CONSTANT | VT_VOLATILE);
         if ((type & VT_BTYPE) != VT_BYTE)
             type &= ~VT_DEFSIGN;
         if (type == VT_PTR)
@@ -663,6 +670,19 @@ static void tcc_debug_extern_sym(TCCState *s1, Sym *sym, int sh_num, int sym_bin
         tcc_debug_stabs(s1, str.data,
             (sym->type.t & VT_STATIC) && data_section == s
             ? N_STSYM : N_LCSYM, 0, s, sym->c);
+    cstr_free (&str);
+}
+
+static void tcc_debug_typedef(TCCState *s1, Sym *sym)
+{
+    CString str;
+
+    cstr_new (&str);
+    cstr_printf (&str, "%s:t",
+                 (sym->v & ~SYM_FIELD) >= SYM_FIRST_ANOM
+                 ? "" : get_tok_str(sym->v & ~SYM_FIELD, NULL));
+    tcc_get_debug_info(s1, sym, &str);
+    tcc_debug_stabs(s1, str.data, N_LSYM, 0, NULL, 0);
     cstr_free (&str);
 }
 
@@ -926,10 +946,8 @@ ST_FUNC void put_extern_sym2(Sym *sym, int sh_num,
 #endif
 
         if (sym->asm_label) {
-            name = get_tok_str(sym->asm_label & ~SYM_FIELD, NULL);
-            /* with SYM_FIELD it was __attribute__((alias("..."))) actually */
-            if (!(sym->asm_label & SYM_FIELD))
-                can_add_underscore = 0;
+            name = get_tok_str(sym->asm_label, NULL);
+            can_add_underscore = 0;
         }
 
         if (tcc_state->leading_underscore && can_add_underscore) {
@@ -1511,6 +1529,8 @@ static void merge_attr(AttributeDef *ad, AttributeDef *ad1)
 
     if (ad1->section)
       ad->section = ad1->section;
+    if (ad1->alias_target)
+      ad->alias_target = ad1->alias_target;
     if (ad1->asm_label)
       ad->asm_label = ad1->asm_label;
     if (ad1->attr_mode)
@@ -2153,16 +2173,17 @@ ST_FUNC int gv(int rc)
     } else {
         if (is_float(vtop->type.t) && 
             (vtop->r & (VT_VALMASK | VT_LVAL)) == VT_CONST) {
-            unsigned long offset;
             /* CPUs usually cannot use float constants, so we store them
                generically in data segment */
+            init_params p = { data_section };
+            unsigned long offset;
             size = type_size(&vtop->type, &align);
             if (NODATA_WANTED)
                 size = 0, align = 1;
-            offset = section_add(data_section, size, align);
-            vpush_ref(&vtop->type, data_section, offset, size);
+            offset = section_add(p.sec, size, align);
+            vpush_ref(&vtop->type, p.sec, offset, size);
 	    vswap();
-	    init_putv(&vtop->type, data_section, offset);
+	    init_putv(&p, &vtop->type, offset);
 	    vtop->r |= VT_LVAL;
         }
 #ifdef CONFIG_TCC_BCHECK
@@ -4134,8 +4155,8 @@ redo:
         case TOK_ALIAS2:
             skip('(');
 	    parse_mult_str(&astr, "alias(\"target\")");
-            ad->asm_label = /* save string as token, for later */
-                tok_alloc((char*)astr.data, astr.size-1)->tok | SYM_FIELD;
+            ad->alias_target = /* save string as token, for later */
+                tok_alloc((char*)astr.data, astr.size-1)->tok;
             skip(')');
 	    cstr_free(&astr);
             break;
@@ -5430,7 +5451,7 @@ static void parse_builtin_params(int nc, const char *args)
                 type.t = VT_SIZE_T;
                 break;
 	    default:
-                tcc_error("internal error");
+                break;
 	}
         gen_assign_cast(&type);
     }
@@ -5570,7 +5591,9 @@ ST_FUNC void unary(void)
         } else if (tok == '{') {
 	    int saved_nocode_wanted = nocode_wanted;
             if (const_wanted && !(nocode_wanted & unevalmask))
-                tcc_error("expected constant");
+                expect("constant");
+            if (0 == local_scope)
+                tcc_error("statement expression outside of function");
             /* save all registers */
             save_regs(0);
             /* statement expression : we do not accept break/continue
@@ -6087,6 +6110,10 @@ special_math_val:
                     /* pass it as 'int' to avoid structure arg passing
                        problems */
                     vseti(VT_LOCAL, loc);
+#ifdef CONFIG_TCC_BCHECK
+                    if (tcc_state->do_bounds_check)
+                        --loc;
+#endif
                     ret.c = vtop->c;
                     if (ret_nregs < 0)
                       vtop--;
@@ -6925,7 +6952,12 @@ static void block(int is_expr)
     }
 
 again:
-    t = tok, next();
+    t = tok;
+    /* If the token carries a value, next() might destroy it. Only with
+       invalid code such as f(){"123"4;} */
+    if (TOK_HAS_VALUE(t))
+        goto expr;
+    next();
 
     if (t == TOK_IF) {
         skip('(');
@@ -7228,6 +7260,7 @@ again:
             /* expression case */
             if (t != ';') {
                 unget_tok(t);
+    expr:
                 if (is_expr) {
                     vpop();
                     gexpr();
@@ -7309,10 +7342,22 @@ static void parse_init_elem(int expr_type)
     }
 }
 
-/* put zeros for variable based init */
-static void init_putz(Section *sec, unsigned long c, int size)
+#if 1
+static void init_assert(init_params *p, int offset)
 {
-    if (sec) {
+    if (p->sec ? !NODATA_WANTED && offset > p->sec->data_offset
+               : !nocode_wanted && offset > p->local_offset)
+        tcc_internal_error("initializer overflow");
+}
+#else
+#define init_assert(sec, offset)
+#endif
+
+/* put zeros for variable based init */
+static void init_putz(init_params *p, unsigned long c, int size)
+{
+    init_assert(p, c + size);
+    if (p->sec) {
         /* nothing to do because globals are already set to zero */
     } else {
         vpush_global_sym(&func_old_type, TOK_memset);
@@ -7331,6 +7376,37 @@ static void init_putz(Section *sec, unsigned long c, int size)
 #define DIF_FIRST     1
 #define DIF_SIZE_ONLY 2
 #define DIF_HAVE_ELEM 4
+#define DIF_CLEAR     8
+
+/* delete relocations for specified range c ... c + size. Unfortunatly
+   in very special cases, relocations may occur unordered */
+static void decl_design_delrels(Section *sec, int c, int size)
+{
+    ElfW_Rel *rel, *rel2, *rel_end;
+    if (!sec || !sec->reloc)
+        return;
+    rel = rel2 = (ElfW_Rel*)sec->reloc->data;
+    rel_end = (ElfW_Rel*)(sec->reloc->data + sec->reloc->data_offset);
+    while (rel < rel_end) {
+        if (rel->r_offset >= c && rel->r_offset < c + size) {
+            sec->reloc->data_offset -= sizeof *rel;
+        } else {
+            if (rel2 != rel)
+                memcpy(rel2, rel, sizeof *rel);
+            ++rel2;
+        }
+        ++rel;
+    }
+}
+
+static void decl_design_flex(init_params *p, Sym *ref, int index)
+{
+    if (ref == p->flex_array_ref) {
+        if (index >= ref->c)
+            ref->c = index + 1;
+    } else if (ref->c < 0)
+        tcc_error("flexible array has zero size in this context");
+}
 
 /* t is the array or struct type. c is the array or struct
    address. cur_field is the pointer to the current
@@ -7338,7 +7414,7 @@ static void init_putz(Section *sec, unsigned long c, int size)
    index.  'flags' is as in decl_initializer.
    'al' contains the already initialized length of the
    current container (starting at c).  This returns the new length of that.  */
-static int decl_designator(CType *type, Section *sec, unsigned long c,
+static int decl_designator(init_params *p, CType *type, unsigned long c,
                            Sym **cur_field, int flags, int al)
 {
     Sym *s, *f;
@@ -7371,9 +7447,9 @@ static int decl_designator(CType *type, Section *sec, unsigned long c,
             }
             skip(']');
             s = type->ref;
-	    if (index < 0 || (s->c >= 0 && index_last >= s->c) ||
-		index_last < index)
-	        tcc_error("invalid index");
+            decl_design_flex(p, s, index_last);
+            if (index < 0 || index_last >= s->c || index_last < index)
+	        tcc_error("index exceeds array bounds or range is empty");
             if (cur_field)
 		(*cur_field)->c = index_last;
             type = pointed_type(type);
@@ -7409,77 +7485,82 @@ static int decl_designator(CType *type, Section *sec, unsigned long c,
     no_designator:
         if (type->t & VT_ARRAY) {
 	    index = (*cur_field)->c;
-	    if (type->ref->c >= 0 && index >= type->ref->c)
-	        tcc_error("index too large");
+            s = type->ref;
+            decl_design_flex(p, s, index);
+            if (index >= s->c)
+                tcc_error("too many initializers");
             type = pointed_type(type);
-            c += index * type_size(type, &align);
+            elem_size = type_size(type, &align);
+            c += index * elem_size;
         } else {
             f = *cur_field;
 	    while (f && (f->v & SYM_FIRST_ANOM) && (f->type.t & VT_BITFIELD))
 	        *cur_field = f = f->next;
             if (!f)
-                tcc_error("too many field init");
+                tcc_error("too many initializers");
 	    type = &f->type;
             c += f->c;
         }
     }
 
-    /* must put zero in holes (note that doing it that way
-       ensures that it even works with designators) */
-    if (!(flags & DIF_SIZE_ONLY)) {
-        int zlen = c - (corig + al);
-        if (type->t & VT_BITFIELD) /* must include current field too */
-            zlen += type_size(type, &align);
-        if (zlen > 0)
-	    init_putz(sec, corig + al, zlen);
+    if (!elem_size) /* for structs */
+        elem_size = type_size(type, &align);
+
+    /* Using designators the same element can be initialized more
+       than once.  In that case we need to delete possibly already
+       existing relocations. */
+    if (!(flags & DIF_SIZE_ONLY) && c - corig < al) {
+        decl_design_delrels(p->sec, c, elem_size * nb_elems);
+        flags &= ~DIF_CLEAR; /* mark stack dirty too */
     }
 
-    decl_initializer(type, sec, c, flags & ~DIF_FIRST);
+    decl_initializer(p, type, c, flags & ~DIF_FIRST);
 
-    /* XXX: make it more general */
     if (!(flags & DIF_SIZE_ONLY) && nb_elems > 1) {
-        unsigned long c_end;
-        uint8_t *src, *dst;
+        Sym aref = {0};
+        CType t1;
         int i;
-
-        if (!sec) {
+        if (p->sec || (type->t & VT_ARRAY)) {
+            /* make init_putv/vstore believe it were a struct */
+            aref.c = elem_size;
+            t1.t = VT_STRUCT, t1.ref = &aref;
+            type = &t1;
+        }
+        if (p->sec)
+            vpush_ref(type, p->sec, c, elem_size);
+        else
 	    vset(type, VT_LOCAL|VT_LVAL, c);
-	    for (i = 1; i < nb_elems; i++) {
-		vset(type, VT_LOCAL|VT_LVAL, c + elem_size * i);
-		vswap();
-		vstore();
-	    }
-	    vpop();
-        } else if (!NODATA_WANTED) {
-	    c_end = c + nb_elems * elem_size;
-	    if (c_end > sec->data_allocated)
-	        section_realloc(sec, c_end);
-	    src = sec->data + c;
-	    dst = src;
-	    for(i = 1; i < nb_elems; i++) {
-		dst += elem_size;
-		memcpy(dst, src, elem_size);
-	    }
+        for (i = 1; i < nb_elems; i++) {
+            vdup();
+            init_putv(p, type, c + elem_size * i);
 	}
+        vpop();
     }
-    c += nb_elems * type_size(type, &align);
+
+    c += nb_elems * elem_size;
     if (c - corig > al)
       al = c - corig;
     return al;
 }
 
 /* store a value or an expression directly in global data or in local array */
-static void init_putv(CType *type, Section *sec, unsigned long c)
+static void init_putv(init_params *p, CType *type, unsigned long c)
 {
     int bt;
     void *ptr;
     CType dtype;
+    int size, align;
+    Section *sec = p->sec;
 
     dtype = *type;
     dtype.t &= ~VT_CONSTANT; /* need to do that to avoid false warning */
 
+    size = type_size(type, &align);
+    if (type->t & VT_BITFIELD)
+        size = (BIT_POS(type->t) + BIT_SIZE(type->t) + 7) / 8;
+    init_assert(p, c + size);
+
     if (sec) {
-	int size, align;
         /* XXX: not portable */
         /* XXX: generate error if incorrect relocation */
         gen_assign_cast(&dtype);
@@ -7499,8 +7580,6 @@ static void init_putv(CType *type, Section *sec, unsigned long c)
             return;
         }
 
-	size = type_size(type, &align);
-	section_reserve(sec, c + size);
         ptr = sec->data + c;
 
         /* XXX: make code faster ? */
@@ -7537,12 +7616,6 @@ static void init_putv(CType *type, Section *sec, unsigned long c)
 		      continue;
 		    if (rel->r_offset < esym->st_value)
 		      break;
-		    /* Note: if the same fields are initialized multiple
-		       times (possible with designators) then we possibly
-		       add multiple relocations for the same offset here.
-		       That would lead to wrong code, the last reloc needs
-		       to win.  We clean this up later after the whole
-		       initializer is parsed.  */
 		    put_elf_reloca(symtab_section, sec,
 				   c + rel->r_offset - esym->st_value,
 				   ELFW(R_TYPE)(rel->r_info),
@@ -7580,10 +7653,10 @@ static void init_putv(CType *type, Section *sec, unsigned long c)
 	    case VT_BOOL:
 		vtop->c.i = vtop->c.i != 0;
 	    case VT_BYTE:
-		*(char *)ptr |= vtop->c.i;
+		*(char *)ptr = vtop->c.i;
 		break;
 	    case VT_SHORT:
-		*(short *)ptr |= vtop->c.i;
+		*(short *)ptr = vtop->c.i;
 		break;
 	    case VT_FLOAT:
 		*(float*)ptr = vtop->c.f;
@@ -7612,7 +7685,7 @@ static void init_putv(CType *type, Section *sec, unsigned long c)
 		break;
 #if PTR_SIZE != 8
 	    case VT_LLONG:
-		*(long long *)ptr |= vtop->c.i;
+		*(long long *)ptr = vtop->c.i;
 		break;
 #else
 	    case VT_LLONG:
@@ -7624,11 +7697,11 @@ static void init_putv(CType *type, Section *sec, unsigned long c)
 		    if (vtop->r & VT_SYM)
 		      greloca(sec, vtop->sym, c, R_DATA_PTR, val);
 		    else
-		      *(addr_t *)ptr |= val;
+		      *(addr_t *)ptr = val;
 #else
 		    if (vtop->r & VT_SYM)
 		      greloc(sec, vtop->sym, c, R_DATA_PTR);
-		    *(addr_t *)ptr |= val;
+		    *(addr_t *)ptr = val;
 #endif
 		    break;
 		}
@@ -7639,11 +7712,11 @@ static void init_putv(CType *type, Section *sec, unsigned long c)
 		    if (vtop->r & VT_SYM)
 		      greloca(sec, vtop->sym, c, R_DATA_PTR, val);
 		    else
-		      *(int *)ptr |= val;
+		      *(int *)ptr = val;
 #else
 		    if (vtop->r & VT_SYM)
 		      greloc(sec, vtop->sym, c, R_DATA_PTR);
-		    *(int *)ptr |= val;
+		    *(int *)ptr = val;
 #endif
 		    break;
 		}
@@ -7663,8 +7736,7 @@ static void init_putv(CType *type, Section *sec, unsigned long c)
    allocation. 'flags & DIF_FIRST' is true if array '{' must be read (multi
    dimension implicit array init handling). 'flags & DIF_SIZE_ONLY' is true if
    size only evaluation is wanted (only for arrays). */
-static void decl_initializer(CType *type, Section *sec, unsigned long c, 
-                             int flags)
+static void decl_initializer(init_params *p, CType *type, unsigned long c, int flags)
 {
     int len, n, no_oblock, i;
     int size1, align1;
@@ -7672,13 +7744,17 @@ static void decl_initializer(CType *type, Section *sec, unsigned long c,
     Sym indexsym;
     CType *t1;
 
+    /* generate line number info */
+    if (!p->sec && tcc_state->do_debug)
+        tcc_debug_line(tcc_state);
+
     if (!(flags & DIF_HAVE_ELEM) && tok != '{' &&
 	/* In case of strings we have special handling for arrays, so
 	   don't consume them as initializer value (which would commit them
 	   to some anonymous symbol).  */
 	tok != TOK_LSTR && tok != TOK_STR &&
 	!(flags & DIF_SIZE_ONLY)) {
-	parse_init_elem(!sec ? EXPR_ANY : EXPR_CONST);
+	parse_init_elem(!p->sec ? EXPR_ANY : EXPR_CONST);
         flags |= DIF_HAVE_ELEM;
     }
 
@@ -7688,22 +7764,20 @@ static void decl_initializer(CType *type, Section *sec, unsigned long c,
 	   The source type might have VT_CONSTANT set, which is
 	   of course assignable to non-const elements.  */
 	is_compatible_unqualified_types(type, &vtop->type)) {
-        init_putv(type, sec, c);
+        goto init_putv;
+
     } else if (type->t & VT_ARRAY) {
+        no_oblock = 1;
+        if (((flags & DIF_FIRST) && tok != TOK_LSTR && tok != TOK_STR) ||
+            tok == '{') {
+            skip('{');
+            no_oblock = 0;
+        }
+
         s = type->ref;
         n = s->c;
         t1 = pointed_type(type);
         size1 = type_size(t1, &align1);
-
-        no_oblock = 1;
-        if (((flags & DIF_FIRST) && tok != TOK_LSTR && tok != TOK_STR) ||
-            tok == '{') {
-            if (tok != '{')
-                tcc_error("character array initializer must be a literal,"
-                    " optionally enclosed in braces");
-            skip('{');
-            no_oblock = 0;
-        }
 
         /* only parse strings here if correct type (otherwise: handle
            them as ((w)char *) expressions */
@@ -7714,7 +7788,6 @@ static void decl_initializer(CType *type, Section *sec, unsigned long c,
              (t1->t & VT_BTYPE) == VT_INT
 #endif
             ) || (tok == TOK_STR && (t1->t & VT_BTYPE) == VT_BYTE)) {
-            int nb;
 	    len = 0;
             cstr_reset(&initstr);
             if (size1 != (tok == TOK_STR ? 1 : sizeof(nwchar_t)))
@@ -7736,54 +7809,61 @@ static void decl_initializer(CType *type, Section *sec, unsigned long c,
                 unget_tok(size1 == 1 ? TOK_STR : TOK_LSTR);
                 tokc.str.size = initstr.size;
                 tokc.str.data = initstr.data;
-                indexsym.c = 0;
-                f = &indexsym;
-                goto do_init_list;
+                goto do_init_array;
             }
-            nb = len;
-            if (n >= 0 && len > n)
-              nb = n;
+
             if (!(flags & DIF_SIZE_ONLY)) {
-                if (sec && !NODATA_WANTED &&
-                    (c + nb > sec->data_allocated))
-                  nb = sec->data_allocated - c;
+                int nb = n;
+                if (len < nb)
+                    nb = len;
                 if (len > nb)
                   tcc_warning("initializer-string for array is too long");
                 /* in order to go faster for common case (char
                    string in global variable, we handle it
                    specifically */
-                if (sec && size1 == 1) {
+                if (p->sec && size1 == 1) {
+                    init_assert(p, c + nb);
                     if (!NODATA_WANTED)
-                      memcpy(sec->data + c, initstr.data, nb);
+                      memcpy(p->sec->data + c, initstr.data, nb);
                 } else {
-                    for(i=0;i<nb;i++) {
-                        if (size1 == 1)
+                    for(i=0;i<n;i++) {
+                        if (i >= nb) {
+                          /* only add trailing zero if enough storage (no
+                             warning in this case since it is standard) */
+                          if (flags & DIF_CLEAR)
+                            break;
+                          if (n - i >= 4) {
+                            init_putz(p, c + i * size1, (n - i) * size1);
+                            break;
+                          }
+                          ch = 0;
+                        } else if (size1 == 1)
                           ch = ((unsigned char *)initstr.data)[i];
                         else
                           ch = ((nwchar_t *)initstr.data)[i];
                         vpushi(ch);
-                        init_putv(t1, sec, c + i * size1);
+                        init_putv(p, t1, c + i * size1);
                     }
                 }
+            } else {
+                decl_design_flex(p, s, len);
             }
-            /* only add trailing zero if enough storage (no
-               warning in this case since it is standard) */
-            if (n < 0 || len < n) {
-                if (!(flags & DIF_SIZE_ONLY)) {
-		    vpushi(0);
-                    init_putv(t1, sec, c + (len * size1));
-                }
-                len++;
-            }
-	    len *= size1;
         } else {
+
+          do_init_array:
 	    indexsym.c = 0;
 	    f = &indexsym;
 
           do_init_list:
+            /* zero memory once in advance */
+            if (!(flags & (DIF_CLEAR | DIF_SIZE_ONLY))) {
+                init_putz(p, c, n*size1);
+                flags |= DIF_CLEAR;
+            }
+
 	    len = 0;
 	    while (tok != '}' || (flags & DIF_HAVE_ELEM)) {
-		len = decl_designator(type, sec, c, &f, flags, len);
+		len = decl_designator(p, type, c, &f, flags, len);
 		flags &= ~DIF_HAVE_ELEM;
 		if (type->t & VT_ARRAY) {
 		    ++indexsym.c;
@@ -7806,16 +7886,9 @@ static void decl_initializer(CType *type, Section *sec, unsigned long c,
 		skip(',');
 	    }
         }
-        /* put zeros at the end */
-	if (!(flags & DIF_SIZE_ONLY) && len < n*size1)
-	    init_putz(sec, c + len, n*size1 - len);
         if (!no_oblock)
             skip('}');
-        /* patch type size if needed, which happens only for array types */
-        if (n < 0)
-            s->c = size1 == 1 ? len : ((len + size1 - 1)/size1);
     } else if ((type->t & VT_BTYPE) == VT_STRUCT) {
-	size1 = 1;
         no_oblock = 1;
         if ((flags & DIF_FIRST) || tok == '{') {
             skip('{');
@@ -7824,12 +7897,13 @@ static void decl_initializer(CType *type, Section *sec, unsigned long c,
         s = type->ref;
         f = s->next;
         n = s->c;
+        size1 = 1;
 	goto do_init_list;
     } else if (tok == '{') {
         if (flags & DIF_HAVE_ELEM)
           skip(';');
         next();
-        decl_initializer(type, sec, c, flags & ~DIF_HAVE_ELEM);
+        decl_initializer(p, type, c, flags & ~DIF_HAVE_ELEM);
         skip('}');
     } else if ((flags & DIF_SIZE_ONLY)) {
 	/* If we supported only ISO C we wouldn't have to accept calling
@@ -7847,9 +7921,17 @@ static void decl_initializer(CType *type, Section *sec, unsigned long c,
 	       string constant to memory too early.  */
 	    if (tok != TOK_STR && tok != TOK_LSTR)
 	      expect("string constant");
-	    parse_init_elem(!sec ? EXPR_ANY : EXPR_CONST);
+	    parse_init_elem(!p->sec ? EXPR_ANY : EXPR_CONST);
 	}
-        init_putv(type, sec, c);
+    init_putv:
+        if (!p->sec && (flags & DIF_CLEAR) /* container was already zero'd */
+            && (vtop->r & (VT_VALMASK | VT_LVAL | VT_SYM)) == VT_CONST
+            && vtop->c.i == 0
+            && btype_size(type->t & VT_BTYPE) /* not for fp constants */
+            )
+            vpop();
+        else
+            init_putv(p, type, c);
     }
 }
 
@@ -7873,51 +7955,60 @@ static void decl_initializer_alloc(CType *type, AttributeDef *ad, int r,
 #ifdef CONFIG_TCC_BCHECK
     int bcheck = tcc_state->do_bounds_check && !NODATA_WANTED;
 #endif
+    init_params p = {0};
 
     /* Always allocate static or global variables */
     if (v && (r & VT_VALMASK) == VT_CONST)
         nocode_wanted |= 0x80000000;
 
     flexible_array = NULL;
-    if ((type->t & VT_BTYPE) == VT_STRUCT) {
+    size = type_size(type, &align);
+
+    /* exactly one flexible array may be initialized, either the
+       toplevel array or the last member of the toplevel struct */
+
+    if (size < 0) {
+        /* If the base type itself was an array type of unspecified size
+           (like in 'typedef int arr[]; arr x = {1};') then we will
+           overwrite the unknown size by the real one for this decl.
+           We need to unshare the ref symbol holding that size. */
+        type->ref = sym_push(SYM_FIELD, &type->ref->type, 0, type->ref->c);
+        p.flex_array_ref = type->ref;
+
+    } else if (has_init && (type->t & VT_BTYPE) == VT_STRUCT) {
         Sym *field = type->ref->next;
         if (field) {
             while (field->next)
                 field = field->next;
-            if (field->type.t & VT_ARRAY && field->type.ref->c < 0)
+            if (field->type.t & VT_ARRAY && field->type.ref->c < 0) {
                 flexible_array = field;
+                p.flex_array_ref = field->type.ref;
+                size = -1;
+            }
         }
     }
 
-    size = type_size(type, &align);
-    /* If unknown size, we must evaluate it before
-       evaluating initializers because
-       initializers can generate global data too
-       (e.g. string pointers or ISOC99 compound
-       literals). It also simplifies local
-       initializers handling */
-    if (size < 0 || (flexible_array && has_init)) {
+    if (size < 0) {
+        /* If unknown size, do a dry-run 1st pass */
         if (!has_init) 
             tcc_error("unknown type size");
-        /* get all init string */
         if (has_init == 2) {
-	    init_str = tok_str_alloc();
             /* only get strings */
+            init_str = tok_str_alloc();
             while (tok == TOK_STR || tok == TOK_LSTR) {
                 tok_str_add_tok(init_str);
                 next();
             }
-	    tok_str_add(init_str, -1);
-	    tok_str_add(init_str, 0);
-        } else {
-	    skip_or_save_block(&init_str);
-        }
+            tok_str_add(init_str, -1);
+            tok_str_add(init_str, 0);
+        } else
+            skip_or_save_block(&init_str);
         unget_tok(0);
 
         /* compute size */
         begin_macro(init_str, 1);
         next();
-        decl_initializer(type, NULL, 0, DIF_FIRST | DIF_SIZE_ONLY);
+        decl_initializer(&p, type, 0, DIF_FIRST | DIF_SIZE_ONLY);
         /* prepare second initializer parsing */
         macro_ptr = init_str->str;
         next();
@@ -7926,13 +8017,14 @@ static void decl_initializer_alloc(CType *type, AttributeDef *ad, int r,
         size = type_size(type, &align);
         if (size < 0) 
             tcc_error("unknown type size");
+
+        /* If there's a flex member and it was used in the initializer
+           adjust size.  */
+        if (flexible_array && flexible_array->type.ref->c > 0)
+            size += flexible_array->type.ref->c
+                    * pointed_size(&flexible_array->type);
     }
-    /* If there's a flex member and it was used in the initializer
-       adjust size.  */
-    if (flexible_array &&
-	flexible_array->type.ref->c > 0)
-        size += flexible_array->type.ref->c
-	        * pointed_size(&flexible_array->type);
+
     /* take into account specified alignment if bigger */
     if (ad->a.aligned) {
 	int speca = 1 << (ad->a.aligned - 1);
@@ -7955,6 +8047,7 @@ static void decl_initializer_alloc(CType *type, AttributeDef *ad, int r,
 #endif
         loc = (loc - size) & -align;
         addr = loc;
+        p.local_offset = addr + size;
 #ifdef CONFIG_TCC_BCHECK
         if (bcheck && v) {
             /* add padding between stack variables for bound checking */
@@ -8071,12 +8164,8 @@ static void decl_initializer_alloc(CType *type, AttributeDef *ad, int r,
         cur_scope->vla.loc = addr;
         cur_scope->vla.num++;
     } else if (has_init) {
-	size_t oldreloc_offset = 0;
-	if (sec && sec->reloc)
-	  oldreloc_offset = sec->reloc->data_offset;
-        decl_initializer(type, sec, addr, DIF_FIRST);
-	if (sec && sec->reloc)
-	  squeeze_multi_relocs(sec, oldreloc_offset);
+        p.sec = sec;
+        decl_initializer(&p, type, addr, DIF_FIRST);
         /* patch flexible array member size back to -1, */
         /* for possible subsequent similar declarations */
         if (flexible_array)
@@ -8200,7 +8289,7 @@ static void free_inline_functions(TCCState *s)
    if parsing old style parameter decl list (and FUNC_SYM is set then) */
 static int decl0(int l, int is_for_loop_init, Sym *func_sym)
 {
-    int v, has_init, r;
+    int v, has_init, r, oldint;
     CType type, btype;
     Sym *sym;
     AttributeDef ad, adbase;
@@ -8231,6 +8320,8 @@ static int decl0(int l, int is_for_loop_init, Sym *func_sym)
             skip(';');
 	    continue;
 	}
+
+        oldint = 0;
         if (!parse_btype(&btype, &adbase)) {
             if (is_for_loop_init)
                 return 0;
@@ -8250,15 +8341,17 @@ static int decl0(int l, int is_for_loop_init, Sym *func_sym)
                /* special test for old K&R protos without explicit int
                   type. Only accepted when defining global data */
                 btype.t = VT_INT;
+                oldint = 1;
             } else {
                 if (tok != TOK_EOF)
                     expect("declaration");
                 break;
             }
         }
+
         if (tok == ';') {
 	    if ((btype.t & VT_BTYPE) == VT_STRUCT) {
-		int v = btype.ref->v;
+		v = btype.ref->v;
 		if (!(v & SYM_FIELD) && (v & ~SYM_STRUCT) >= SYM_FIRST_ANOM)
         	    tcc_warning("unnamed struct/union that defines no instances");
                 next();
@@ -8269,16 +8362,9 @@ static int decl0(int l, int is_for_loop_init, Sym *func_sym)
                 continue;
             }
         }
+
         while (1) { /* iterate thru each declaration */
             type = btype;
-	    /* If the base type itself was an array type of unspecified
-	       size (like in 'typedef int arr[]; arr x = {1};') then
-	       we will overwrite the unknown size by the real one for
-	       this decl.  We need to unshare the ref symbol holding
-	       that size.  */
-	    if ((type.t & VT_ARRAY) && type.ref->c < 0) {
-		type.ref = sym_push(SYM_FIELD, &type.ref->type, 0, type.ref->c);
-	    }
 	    ad = adbase;
             type_decl(&type, &ad, &v, TYPE_DIRECT);
 #if 0
@@ -8311,6 +8397,9 @@ static int decl0(int l, int is_for_loop_init, Sym *func_sym)
                 /* always compile 'extern inline' */
                 if (type.t & VT_EXTERN)
                     type.t &= ~VT_INLINE;
+
+            } else if (oldint) {
+                tcc_warning("type defaults to int");
             }
 
             if (gnu_ext && (tok == TOK_ASM1 || tok == TOK_ASM2 || tok == TOK_ASM3)) {
@@ -8415,6 +8504,8 @@ found:
                     }
                     sym->a = ad.a;
                     sym->f = ad.f;
+                    if (tcc_state->do_debug)
+                        tcc_debug_typedef (tcc_state, sym);
 		} else if ((type.t & VT_BTYPE) == VT_VOID
 			   && !(type.t & VT_EXTERN)) {
 		    tcc_error("declaration of void object");
@@ -8441,6 +8532,20 @@ found:
                         /* external variable or function */
                         type.t |= VT_EXTERN;
                         sym = external_sym(v, &type, r, &ad);
+                        if (ad.alias_target) {
+                            /* Aliases need to be emitted when their target
+                               symbol is emitted, even if perhaps unreferenced.
+                               We only support the case where the base is
+                               already defined, otherwise we would need
+                               deferring to emit the aliases until the end of
+                               the compile unit.  */
+                            Sym *alias_target = sym_find(ad.alias_target);
+                            ElfSym *esym = elfsym(alias_target);
+                            if (!esym)
+                                tcc_error("unsupported forward __alias__ attribute");
+                            put_extern_sym2(sym, esym->st_shndx,
+                                            esym->st_value, esym->st_size, 1);
+                        }
                     } else {
                         if (type.t & VT_STATIC)
                             r |= VT_CONST;

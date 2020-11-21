@@ -202,6 +202,12 @@ ST_FUNC void tccelf_end_file(TCCState *s1)
         }
     }
     tcc_free(tr);
+
+    /* record text/data/bss output for -bench info */
+    for (i = 0; i < 3; ++i) {
+        s = s1->sections[i + 1];
+        s1->total_output[i] += s->data_offset - s->sh_offset;
+    }
 }
 
 ST_FUNC Section *new_section(TCCState *s1, const char *name, int sh_type, int sh_flags)
@@ -315,14 +321,16 @@ ST_FUNC void *section_ptr_add(Section *sec, addr_t size)
     return sec->data + offset;
 }
 
+#ifndef ELF_OBJ_ONLY
 /* reserve at least 'size' bytes from section start */
-ST_FUNC void section_reserve(Section *sec, unsigned long size)
+static void section_reserve(Section *sec, unsigned long size)
 {
     if (size > sec->data_allocated)
         section_realloc(sec, size);
     if (size > sec->data_offset)
         sec->data_offset = size;
 }
+#endif
 
 static Section *find_section_create (TCCState *s1, const char *name, int create)
 {
@@ -756,45 +764,7 @@ ST_FUNC void put_elf_reloc(Section *symtab, Section *s, unsigned long offset,
     put_elf_reloca(symtab, s, offset, type, symbol, 0);
 }
 
-/* Remove relocations for section S->reloc starting at oldrelocoffset
-   that are to the same place, retaining the last of them.  As side effect
-   the relocations are sorted.  Possibly reduces the number of relocs.  */
-ST_FUNC void squeeze_multi_relocs(Section *s, size_t oldrelocoffset)
-{
-    Section *sr = s->reloc;
-    ElfW_Rel *r, *dest;
-    ssize_t a;
-    ElfW(Addr) addr;
-
-    if (oldrelocoffset + sizeof(*r) >= sr->data_offset)
-      return;
-    /* The relocs we're dealing with are the result of initializer parsing.
-       So they will be mostly in order and there aren't many of them.
-       Secondly we need a stable sort (which qsort isn't).  We use
-       a simple insertion sort.  */
-    for (a = oldrelocoffset + sizeof(*r); a < sr->data_offset; a += sizeof(*r)) {
-	ssize_t i = a - sizeof(*r);
-	addr = ((ElfW_Rel*)(sr->data + a))->r_offset;
-	for (; i >= (ssize_t)oldrelocoffset &&
-	       ((ElfW_Rel*)(sr->data + i))->r_offset > addr; i -= sizeof(*r)) {
-	    ElfW_Rel tmp = *(ElfW_Rel*)(sr->data + a);
-	    *(ElfW_Rel*)(sr->data + a) = *(ElfW_Rel*)(sr->data + i);
-	    *(ElfW_Rel*)(sr->data + i) = tmp;
-	}
-    }
-
-    r = (ElfW_Rel*)(sr->data + oldrelocoffset);
-    dest = r;
-    for (; r < (ElfW_Rel*)(sr->data + sr->data_offset); r++) {
-	if (dest->r_offset != r->r_offset)
-	  dest++;
-	*dest = *r;
-    }
-    sr->data_offset = (unsigned char*)dest - sr->data + sizeof(*r);
-}
-
 /* put stab debug information */
-
 ST_FUNC void put_stabs(TCCState *s1, const char *str, int type, int other, int desc,
                       unsigned long value)
 {
