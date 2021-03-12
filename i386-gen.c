@@ -81,6 +81,11 @@ enum {
 #define USING_GLOBALS
 #include "tcc.h"
 
+ST_DATA const char * const target_machine_defs =
+    "__i386__\0"
+    "__i386\0"
+    ;
+
 /* define to 1/0 to [not] have EBX as 4th register */
 #define USE_EBX 0
 
@@ -345,7 +350,7 @@ static void gen_static_call(int v)
 {
     Sym *sym;
 
-    sym = external_global_sym(v, &func_old_type);
+    sym = external_helper_sym(v);
     oad(0xe8, -4);
     greloc(cur_text_section, sym, ind-4, R_386_PC32);
 }
@@ -367,14 +372,14 @@ static void gcall_or_jmp(int is_jmp)
     }
 }
 
-static uint8_t fastcall_regs[3] = { TREG_EAX, TREG_EDX, TREG_ECX };
-static uint8_t fastcallw_regs[2] = { TREG_ECX, TREG_EDX };
+static const uint8_t fastcall_regs[3] = { TREG_EAX, TREG_EDX, TREG_ECX };
+static const uint8_t fastcallw_regs[2] = { TREG_ECX, TREG_EDX };
 
 /* Return the number of registers needed to return the struct, or 0 if
    returning via struct pointer. */
 ST_FUNC int gfunc_sret(CType *vt, int variadic, CType *ret, int *ret_align, int *regsize)
 {
-#ifdef TCC_TARGET_PE
+#if defined(TCC_TARGET_PE) || TARGETOS_FreeBSD || TARGETOS_OpenBSD
     int size, align;
     *ret_align = 1; // Never have to re-align return values for x86
     *regsize = 4;
@@ -418,26 +423,20 @@ ST_FUNC void gfunc_call(int nb_args)
             size = (size + 3) & ~3;
             /* allocate the necessary size on stack */
 #ifdef TCC_TARGET_PE
-            if (size >= 0x4096) {
-                /* cannot call alloca with bound checking. Do stack probing. */
-                o(0x50);               // push %eax
-                oad(0xb8, size - 4);   // mov size-4,%eax
-                oad(0x3d, 4096);       // p1: cmp $4096,%eax
-                o(0x1476);             // jbe <p2>
-                oad(0x248485,-4096);   // test %eax,-4096(%esp)
-                oad(0xec81, 4096);     // sub $4096,%esp
-                oad(0x2d, 4096);       // sub $4096,%eax
-                o(0xe5eb);             // jmp <p1>
-                o(0xc429);             // p2: sub %eax,%esp
-                oad(0xc481, size - 4); // add size-4,%esp
-                o(0x58);               // pop %eax
-            }
+            if (size >= 4096) {
+                r = get_reg(RC_EAX);
+                oad(0x68, size); // push size
+                /* cannot call normal 'alloca' with bound checking */
+                gen_static_call(tok_alloc_const("__alloca"));
+                gadd_sp(4);
+            } else
 #endif
-            oad(0xec81, size); /* sub $xxx, %esp */
-            /* generate structure store */
-            r = get_reg(RC_INT);
-            o(0x89); /* mov %esp, r */
-            o(0xe0 + r);
+            {
+                oad(0xec81, size); /* sub $xxx, %esp */
+                /* generate structure store */
+                r = get_reg(RC_INT);
+                o(0xe089 + (r << 8)); /* mov %esp, r */
+            }
             vset(&vtop->type, r | VT_LVAL, 0);
             vswap();
             vstore();
@@ -480,7 +479,7 @@ ST_FUNC void gfunc_call(int nb_args)
     if ((func_call >= FUNC_FASTCALL1 && func_call <= FUNC_FASTCALL3) ||
         func_call == FUNC_FASTCALLW) {
         int fastcall_nb_regs;
-        uint8_t *fastcall_regs_ptr;
+        const uint8_t *fastcall_regs_ptr;
         if (func_call == FUNC_FASTCALLW) {
             fastcall_regs_ptr = fastcallw_regs;
             fastcall_nb_regs = 2;
@@ -496,7 +495,7 @@ ST_FUNC void gfunc_call(int nb_args)
             args_size -= 4;
         }
     }
-#ifndef TCC_TARGET_PE
+#if !defined(TCC_TARGET_PE) && !TARGETOS_FreeBSD || TARGETOS_OpenBSD
     else if ((vtop->type.ref->type.t & VT_BTYPE) == VT_STRUCT)
         args_size -= 4;
 #endif
@@ -520,7 +519,7 @@ ST_FUNC void gfunc_prolog(Sym *func_sym)
     CType *func_type = &func_sym->type;
     int addr, align, size, func_call, fastcall_nb_regs;
     int param_index, param_addr;
-    uint8_t *fastcall_regs_ptr;
+    const uint8_t *fastcall_regs_ptr;
     Sym *sym;
     CType *type;
 
@@ -546,7 +545,7 @@ ST_FUNC void gfunc_prolog(Sym *func_sym)
     func_sub_sp_offset = ind;
     /* if the function returns a structure, then add an
        implicit pointer parameter */
-#ifdef TCC_TARGET_PE
+#if defined(TCC_TARGET_PE) || TARGETOS_FreeBSD || TARGETOS_OpenBSD
     size = type_size(&func_vt,&align);
     if (((func_vt.t & VT_BTYPE) == VT_STRUCT)
         && (size > 8 || (size & (size - 1)))) {
@@ -587,7 +586,7 @@ ST_FUNC void gfunc_prolog(Sym *func_sym)
     /* pascal type call or fastcall ? */
     if (func_call == FUNC_STDCALL || func_call == FUNC_FASTCALLW)
         func_ret_sub = addr - 8;
-#ifndef TCC_TARGET_PE
+#if !defined(TCC_TARGET_PE) && !TARGETOS_FreeBSD || TARGETOS_OpenBSD
     else if (func_vc)
         func_ret_sub = 4;
 #endif
@@ -839,6 +838,12 @@ ST_FUNC void gen_opf(int op)
 {
     int a, ft, fc, swapped, r;
 
+    if (op == TOK_NEG) { /* unary minus */
+        gv(RC_FLOAT);
+        o(0xe0d9); /* fchs */
+        return;
+    }
+
     /* convert constants to memory references */
     if ((vtop[-1].r & (VT_VALMASK | VT_LVAL)) == VT_CONST) {
         vswap();
@@ -985,11 +990,11 @@ ST_FUNC void gen_cvt_ftoi(int t)
 {
     int bt = vtop->type.t & VT_BTYPE;
     if (bt == VT_FLOAT)
-        vpush_global_sym(&func_old_type, TOK___fixsfdi);
+        vpush_helper_func(TOK___fixsfdi);
     else if (bt == VT_LDOUBLE)
-        vpush_global_sym(&func_old_type, TOK___fixxfdi);
+        vpush_helper_func(TOK___fixxfdi);
     else
-        vpush_global_sym(&func_old_type, TOK___fixdfdi);
+        vpush_helper_func(TOK___fixdfdi);
     vswap();
     gfunc_call(1);
     vpushi(0);
@@ -1016,6 +1021,19 @@ ST_FUNC void gen_cvt_csti(int t)
         | (sz << 3 | xl) << 8
         | (r << 3 | r) << 16
         );
+}
+
+/* increment tcov counter */
+ST_FUNC void gen_increment_tcov (SValue *sv)
+{
+   o(0x0583); /* addl $1, xxx */
+   greloc(cur_text_section, sv->sym, ind, R_386_32);
+   gen_le32(0);
+   o(1);
+   o(0x1583); /* addcl $0, xxx */
+   greloc(cur_text_section, sv->sym, ind, R_386_32);
+   gen_le32(4);
+   g(0);
 }
 
 /* computed goto support */
@@ -1099,7 +1117,7 @@ ST_FUNC void gen_vla_alloc(CType *type, int align) {
 #endif
     if (use_call)
     {
-        vpush_global_sym(&func_old_type, TOK_alloca);
+        vpush_helper_func(TOK_alloca);
         vswap(); /* Move alloca ref past allocation size */
         gfunc_call(1);
     }

@@ -23,29 +23,13 @@ TESTS = \
  tests2-dir \
  pp-dir
 
-BTESTS = btest test1b
 # test4_static -- Not all relocation types are implemented yet.
 # asmtest / asmtest2 -- minor differences with gcc
 
-# bounds-checking is supported on i386 and x86_64 on linux and windows
-ifeq (-$(CONFIG_musl)-, --)
-ifeq ($(ARCH),i386)
- TESTS += $(BTESTS)
+ifneq ($(CONFIG_bcheck),no)
+ TESTS += btest test1b
 endif
-ifeq ($(ARCH),x86_64)
- TESTS += $(BTESTS)
-endif
-ifeq ($(ARCH),arm)
- TESTS += $(BTESTS)
-endif
-ifeq ($(ARCH),arm64)
- TESTS += $(BTESTS)
-endif
-ifeq ($(ARCH),riscv64)
- TESTS += $(BTESTS)
-endif
-endif
-ifdef CONFIG_OSX # some don't work yet
+ifeq ($(CONFIG_dll),no)
  TESTS := $(filter-out dlltest, $(TESTS))
 endif
 ifeq (,$(filter arm64 i386 x86_64,$(ARCH)))
@@ -55,31 +39,35 @@ ifeq ($(CONFIG_arm_eabi),yes)
  TESTS := $(filter-out test3,$(TESTS))
 endif
 ifeq (,$(filter i386 x86_64,$(ARCH)))
- TESTS := $(filter-out dlltest asm-c-connect-test,$(TESTS))
+ TESTS := $(filter-out asm-c-connect-test,$(TESTS))
 endif
-
 ifeq ($(OS),Windows_NT) # for libtcc_test to find libtcc.dll
  PATH := $(CURDIR)/$(TOP)$(if $(findstring ;,$(PATH)),;,:)$(PATH)
 endif
-
 ifdef CONFIG_OSX
 LIBS += $(LINK_LIBTCC)
 endif
-
-
 ifeq ($(ARCH),arm)
 # tcctest refers to the alignment of functions, and with thumb mode
 # the low bit of code addresses selects the mode, so the "alignment"
 # of functions via bit masking comes out as 1.  Just disable thumb.
 test.ref: CFLAGS+=-marm
 endif
-ifeq ($(ARCH),i386)
+ifeq ($(ARCH)$(CONFIG_WIN32),i386)
 # tcctest.c:get_asm_string uses a construct that is checked too strictly
 # by GCC in 32bit mode when PIC is enabled.
-test.ref: CFLAGS+=-fno-PIC -fno-PIE
+test.ref: CFLAGS+=-fno-PIC -fno-PIE -Wl,-z,notext
 endif
 ifeq ($(CC_NAME),msvc)
 test.ref abitest : CC = gcc
+endif
+ifeq ($(TARGETOS),OpenBSD)
+dlltest: CFLAGS+=-fno-stack-protector
+endif
+ifneq (,$(filter FreeBSD NetBSD,$(TARGETOS)))
+  # test3 has dlsym problems
+  TESTS := $(filter-out test3,$(TESTS))
+  TESTS += test1
 endif
 
 RUN_TCC = $(NATIVE_DEFINES) -run $(TOPSRC)/tcc.c $(TCCFLAGS)
@@ -235,11 +223,16 @@ asmtest.ref: asmtest.S
 	$(CC) -Wa,-W -o asmtest.ref.o -c asmtest.S
 	objdump -D asmtest.ref.o > asmtest.ref
 
+ifeq ($(ARCH),arm)
+asmtest asmtest2:
+	TCC="${TCC}" ./arm-asm-testsuite.sh
+else
 asmtest asmtest2: asmtest.ref
 	@echo ------------ $@ ------------
 	$(TCC) $(MAYBE_RUN_TCC) -c asmtest.S
 	objdump -D asmtest.o > asmtest.out
 	@if diff -u --ignore-matching-lines="file format" asmtest.ref asmtest.out ; then echo "ASM Auto Test OK"; fi
+endif
 
 # test assembler with tcc compiled by itself
 asmtest2: MAYBE_RUN_TCC = $(RUN_TCC)
@@ -283,16 +276,38 @@ asm-c-connect-test: asm-c-connect$(EXESUF) asm-c-connect-sep$(EXESUF)
 	./asm-c-connect-sep$(EXESUF) > asm-c-connect.out2 && cat asm-c-connect.out2
 	@diff -u asm-c-connect.out1 asm-c-connect.out2 || (echo "error"; exit 1)
 
-TCC_YY = $(foreach T,$(TCC_X),$(if $(wildcard $(TOP)/$T-tcc$(EXESUF)),$T))
-
-cross-test :
-	$(if $(strip $(TCC_YY)),\
-	    $(MAKE) $(foreach T,$(TCC_YY),cross-$T.test) --no-print-directory,:)
-
-cross-%.test :
+# quick sanity check for cross-compilers
+cross-test : tcctest.c examples/ex3.c
 	@echo ------------ $@ ------------
-	$(TOP)/$*-tcc$(EXESUF) -v $(TCCFLAGS-$(if $(findstring win,$*),win,unx))\
-	    -c $(TOPSRC)/examples/ex3.c
+	$(foreach T,$(CROSS-TGTS),$(call CROSS-COMPILE,$T))
+
+CROSS-TGTS = \
+ i386 \
+ i386-win32 \
+ i386-OpenBSD \
+ x86_64 \
+ x86_64-win32 \
+ x86_64-osx \
+ x86_64-FreeBSD \
+ x86_64-NetBSD \
+ x86_64-OpenBSD \
+ arm-fpa \
+ arm-eabihf \
+ arm-NetBSD \
+ arm-wince \
+ arm64 \
+ arm64-FreeBSD \
+ arm64-NetBSD \
+ arm64-OpenBSD \
+ riscv64 \
+ c67
+
+define CROSS-COMPILE
+ @echo " . $(1)"
+ $(TCC) $(DEF-$1) -DTCC_CROSS_TEST -run $(TOPSRC)/tcc.c \
+    -c $(if $(findstring c67,$1),$(filter %/ex3.c,$^),$<) -w $(TCCFLAGS)
+
+endef
 
 # targets for development
 %.bin: %.c tcc

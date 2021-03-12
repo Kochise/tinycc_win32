@@ -50,6 +50,15 @@
 #include "tcc.h"
 #include <assert.h>
 
+ST_DATA const char * const target_machine_defs =
+#if defined(__APPLE__)
+    "__aarch64__\0"
+    "__arm64__\0"
+#else
+    "__aarch64__\0"
+#endif
+    ;
+
 ST_DATA const int reg_classes[NB_REGS] = {
   RC_INT | RC_R(0),
   RC_INT | RC_R(1),
@@ -493,8 +502,11 @@ ST_FUNC void load(int r, SValue *sv)
     }
 
     if (svr == (VT_CONST | VT_LVAL)) {
-        arm64_sym(30, sv->sym, // use x30 for address
-	          arm64_check_offset(0, arm64_type_size(svtt), sv->c.i));
+	if (sv->sym)
+            arm64_sym(30, sv->sym, // use x30 for address
+	              arm64_check_offset(0, arm64_type_size(svtt), sv->c.i));
+	else
+	    arm64_movimm (30, sv->c.i);
         if (IS_FREG(r))
             arm64_ldrv(arm64_type_size(svtt), fltr(r), 30,
 		       arm64_check_offset(1, arm64_type_size(svtt), sv->c.i));
@@ -587,7 +599,7 @@ ST_FUNC void load(int r, SValue *sv)
         return;
     }
 
-    printf("load(%x, (%x, %x, %llx))\n", r, svtt, sv->r, (long long)svcul);
+    printf("load(%x, (%x, %x, %lx))\n", r, svtt, sv->r, (long)svcul);
     assert(0);
 }
 
@@ -608,8 +620,11 @@ ST_FUNC void store(int r, SValue *sv)
     }
 
     if (svr == (VT_CONST | VT_LVAL)) {
-        arm64_sym(30, sv->sym, // use x30 for address
-		  arm64_check_offset(0, arm64_type_size(svtt), sv->c.i));
+	if (sv->sym)
+            arm64_sym(30, sv->sym, // use x30 for address
+		      arm64_check_offset(0, arm64_type_size(svtt), sv->c.i));
+	else
+	    arm64_movimm (30, sv->c.i);
         if (IS_FREG(r))
             arm64_strv(arm64_type_size(svtt), fltr(r), 30,
 		       arm64_check_offset(1, arm64_type_size(svtt), sv->c.i));
@@ -639,7 +654,7 @@ ST_FUNC void store(int r, SValue *sv)
         return;
     }
 
-    printf("store(%x, (%x, %x, %llx))\n", r, svtt, sv->r, (long long)svcul);
+    printf("store(%x, (%x, %x, %lx))\n", r, svtt, sv->r, (long)svcul);
     assert(0);
 }
 
@@ -662,7 +677,7 @@ static void arm64_gen_bl_or_b(int b)
 
 static void gen_bounds_call(int v)
 {
-    Sym *sym = external_global_sym(v, &func_old_type);
+    Sym *sym = external_helper_sym(v);
 
     greloca(cur_text_section, sym, ind, R_AARCH64_CALL26, 0);
     o(0x94000000); // bl
@@ -1782,7 +1797,7 @@ ST_FUNC void gen_opf(int op)
         case TOK_GT: func = TOK___gttf2; cond = 13; break;
         default: assert(0); break;
         }
-        vpush_global_sym(&func_old_type, func);
+        vpush_helper_func(func);
         vrott(3);
         gfunc_call(2);
         vpushi(0);
@@ -1885,7 +1900,7 @@ ST_FUNC void gen_cvt_itof(int t)
         int func = (f & VT_BTYPE) == VT_LLONG ?
           (f & VT_UNSIGNED ? TOK___floatunditf : TOK___floatditf) :
           (f & VT_UNSIGNED ? TOK___floatunsitf : TOK___floatsitf);
-        vpush_global_sym(&func_old_type, func);
+        vpush_helper_func(func);
         vrott(2);
         gfunc_call(1);
         vpushi(0);
@@ -1913,7 +1928,7 @@ ST_FUNC void gen_cvt_ftoi(int t)
         int func = (t & VT_BTYPE) == VT_LLONG ?
           (t & VT_UNSIGNED ? TOK___fixunstfdi : TOK___fixtfdi) :
           (t & VT_UNSIGNED ? TOK___fixunstfsi : TOK___fixtfsi);
-        vpush_global_sym(&func_old_type, func);
+        vpush_helper_func(func);
         vrott(2);
         gfunc_call(1);
         vpushi(0);
@@ -1947,7 +1962,7 @@ ST_FUNC void gen_cvt_ftof(int t)
         int func = (t == VT_LDOUBLE) ?
             (f == VT_FLOAT ? TOK___extendsftf2 : TOK___extenddftf2) :
             (t == VT_FLOAT ? TOK___trunctfsf2 : TOK___trunctfdf2);
-        vpush_global_sym(&func_old_type, func);
+        vpush_helper_func(func);
         vrott(2);
         gfunc_call(1);
         vpushi(0);
@@ -1970,6 +1985,24 @@ ST_FUNC void gen_cvt_ftof(int t)
         else
             o(0x1e624000 | x | a << 5); // fcvt s(x),d(a)
     }
+}
+
+/* increment tcov counter */
+ST_FUNC void gen_increment_tcov (SValue *sv)
+{
+    int r1, r2;
+
+    vpushv(sv);
+    vtop->r = r1 = get_reg(RC_INT);
+    r2 = get_reg(RC_INT);
+    greloca(cur_text_section, sv->sym, ind, R_AARCH64_ADR_GOT_PAGE, 0);
+    o(0x90000000 | r1);            // adrp r1, #sym
+    greloca(cur_text_section, sv->sym, ind, R_AARCH64_LD64_GOT_LO12_NC, 0);
+    o(0xf9400000 | r1 | (r1 << 5)); // ld xr,[xr, #sym]
+    o(0xf9400000 | (intr(r1)<<5) | intr(r2)); // ldr r2, [r1]
+    o(0x91000400 | (intr(r2)<<5) | intr(r2)); // add r2, r2, #1
+    o(0xf9000000 | (intr(r1)<<5) | intr(r2)); // str r2, [r1]
+    vpop();
 }
 
 ST_FUNC void ggoto(void)
@@ -2061,7 +2094,7 @@ ST_FUNC void gen_vla_alloc(CType *type, int align) {
         vtop->r = TREG_R(0);
         o(0x910003e0 | vtop->r); // mov r0,sp
         vswap();
-        vpush_global_sym(&func_old_type, TOK___bound_new_region);
+        vpush_helper_func(TOK___bound_new_region);
         vrott(3);
         gfunc_call(2);
         func_bound_add_epilog = 1;

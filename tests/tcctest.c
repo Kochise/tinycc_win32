@@ -21,7 +21,9 @@
 typedef __SIZE_TYPE__ uintptr_t;
 #endif
 
-#if defined(_WIN32)
+#if defined(_WIN32) || \
+    (defined(__arm__) && \
+     (defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)))
 #define LONG_LONG_FORMAT "%lld"
 #define ULONG_LONG_FORMAT "%llu"
 #else
@@ -2128,6 +2130,15 @@ float strtof(const char *nptr, char **endptr);
 LONG_DOUBLE strtold(const char *nptr, char **endptr);
 #endif
 
+#if CC_NAME == CC_clang
+/* In clang 0.0/0.0 is nan and not -nan.
+   Also some older clang version do v=-v
+   as v = -0 - v */
+static char enable_nan_test = 0;
+#else
+static char enable_nan_test = 1;
+#endif
+
 #define FTEST(prefix, typename, type, fmt)\
 void prefix ## cmp(type a, type b)\
 {\
@@ -2227,6 +2238,12 @@ void prefix ## signed_zeros(void) \
   else\
     printf ("x != -y; this is wrong!\n");\
 }\
+void prefix ## nan(void)\
+{\
+    type nan = 0.0/0.0;\
+    type nnan = -nan; \
+    printf("nantest: " fmt " " fmt "\n", nan, nnan);\
+}\
 void prefix ## test(void)\
 {\
     printf("testing '%s'\n", #typename);\
@@ -2237,6 +2254,7 @@ void prefix ## test(void)\
     prefix ## fcast(-2334.6);\
     prefix ## call();\
     prefix ## signed_zeros();\
+    if (enable_nan_test) prefix ## nan();\
 }
 
 FTEST(f, float, float, "%f")
@@ -2313,7 +2331,7 @@ int fib(int n)
         return fib(n-1) + fib(n-2);
 }
 
-#if __GNUC__ == 3
+#if __GNUC__ == 3 || __GNUC__ == 4
 # define aligned_function 0
 #else
 void __attribute__((aligned(16))) aligned_function(int i) {}
@@ -2799,14 +2817,12 @@ void stdarg_test(void)
     stdarg_for_struct(bob, bob2, bob3, bob4, bob, bob, bob.profile);
     stdarg_for_libc("stdarg_for_libc: %s %.2f %d\n", "string", 1.23, 456);
     stdarg_syntax(1, 17);
-#ifndef __riscv
     stdarg_double_struct(6,-1,pts[0],pts[1],pts[2],pts[3],pts[4],pts[5]);
     stdarg_double_struct(7,1,pts[0],-1.0,pts[1],pts[2],pts[3],pts[4],pts[5]);
     stdarg_double_struct(7,2,pts[0],pts[1],-1.0,pts[2],pts[3],pts[4],pts[5]);
     stdarg_double_struct(7,3,pts[0],pts[1],pts[2],-1.0,pts[3],pts[4],pts[5]);
     stdarg_double_struct(7,4,pts[0],pts[1],pts[2],pts[3],-1.0,pts[4],pts[5]);
     stdarg_double_struct(7,5,pts[0],pts[1],pts[2],pts[3],pts[4],-1.0,pts[5]);
-#endif
 }
 
 int reltab[3] = { 1, 2, 3 };
@@ -2814,9 +2830,6 @@ int reltab[3] = { 1, 2, 3 };
 int *rel1 = &reltab[1];
 int *rel2 = &reltab[2];
 
-#ifdef _WIN64
-void relocation_test(void) {}
-#else
 void getmyaddress(void)
 {
     printf("in getmyaddress\n");
@@ -2834,7 +2847,7 @@ long __pa_symbol(void)
 }
 #endif
 
-unsigned long theaddress = (unsigned long)getmyaddress;
+uintptr_t theaddress = (uintptr_t)getmyaddress;
 void relocation_test(void)
 {
     void (*fptr)(void) = (void (*)(void))theaddress;
@@ -2845,7 +2858,6 @@ void relocation_test(void)
     printf("pa_symbol=0x%lx\n", __pa_symbol() >> 63);
 #endif
 }
-#endif
 
 void old_style_f(a,b,c)
      int a, b;
@@ -4038,7 +4050,7 @@ void builtin_frame_address_test(void)
     char *fp0 = __builtin_frame_address(0);
 
     printf("str: %s\n", str);
-#ifndef __riscv
+#ifndef __riscv // gcc dumps core. tcc, clang work
     bfa1(str-fp0);
 #endif
 #endif

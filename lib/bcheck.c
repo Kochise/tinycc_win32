@@ -65,6 +65,7 @@
  || defined(__NetBSD__) \
  || defined(__dietlibc__)
 
+#include <sys/mman.h>
 #define INIT_SEM()
 #define EXIT_SEM()
 #define WAIT_SEM()
@@ -160,6 +161,9 @@ static pthread_spinlock_t bounds_spin;
 #define HAVE_TLS_FUNC          (1)
 #define HAVE_TLS_VAR           (0)
 #endif
+#ifdef TCC_MUSL
+# undef HAVE_CTYPE
+#endif
 #endif
 
 #if MALLOC_REDIR
@@ -219,6 +223,12 @@ typedef struct alloca_list_struct {
 #if defined(_WIN32)
 #define BOUND_TID_TYPE   DWORD
 #define BOUND_GET_TID    GetCurrentThreadId()
+#elif defined(__OpenBSD__)
+#define BOUND_TID_TYPE   pid_t
+#define BOUND_GET_TID    syscall (SYS_getthrid)
+#elif defined(__FreeBSD__) || defined(__NetBSD__)
+#define BOUND_TID_TYPE   pid_t
+#define BOUND_GET_TID    0
 #elif defined(__i386__) || defined(__x86_64__) || defined(__arm__) || defined(__aarch64__) || defined(__riscv)
 #define BOUND_TID_TYPE   pid_t
 #define BOUND_GET_TID    syscall (SYS_gettid)
@@ -279,7 +289,7 @@ DLL_EXPORT char *__bound_strcat(char *dest, const char *src);
 DLL_EXPORT char *__bound_strchr(const char *string, int ch);
 DLL_EXPORT char *__bound_strdup(const char *s);
 
-#if defined(__arm__)
+#if defined(__arm__) && defined(__ARM_EABI__)
 DLL_EXPORT void *__bound___aeabi_memcpy(void *dst, const void *src, size_t size);
 DLL_EXPORT void *__bound___aeabi_memmove(void *dst, const void *src, size_t size);
 DLL_EXPORT void *__bound___aeabi_memmove4(void *dst, const void *src, size_t size);
@@ -729,7 +739,7 @@ void __bound_new_region(void *p, size_t size)
     last = NULL;
     cur = alloca_list;
     while (cur) {
-#if defined(__i386__) || (defined(__arm__) && !defined(TCC_ARM_EABI))
+#if defined(__i386__) || (defined(__arm__) && !defined(__ARM_EABI__))
         int align = 4;
 #elif defined(__arm__)
         int align = 8;
@@ -1143,7 +1153,8 @@ void __attribute__((destructor)) __bound_exit(void)
     dprintf(stderr, "%s, %s():\n", __FILE__, __FUNCTION__);
 
     if (inited) {
-#if !defined(_WIN32) && !defined(__APPLE__)
+#if !defined(_WIN32) && !defined(__APPLE__) && !defined TCC_MUSL && \
+    !defined(__OpenBSD__) && !defined(__FreeBSD__) && !defined(__NetBSD__)
         if (print_heap) {
             extern void __libc_freeres (void);
             __libc_freeres ();
@@ -1356,6 +1367,10 @@ int sigaction(int signum, const struct sigaction *act, struct sigaction *oldact)
 
     dprintf (stderr, "%s, %s() %d %p %p\n", __FILE__, __FUNCTION__,
              signum, act, oldact);
+
+    if (sigaction_redir == NULL)
+        __bound_init(0,-1);
+
     if (act) {
         nact = *act;
         if (nact.sa_flags & SA_SIGINFO)
@@ -1727,7 +1742,7 @@ void *__bound_memset(void *s, int c, size_t n)
     return memset(s, c, n);
 }
 
-#if defined(__arm__)
+#if defined(__arm__) && defined(__ARM_EABI__)
 void *__bound___aeabi_memcpy(void *dest, const void *src, size_t n)
 {
     dprintf(stderr, "%s, %s(): %p, %p, 0x%lx\n",

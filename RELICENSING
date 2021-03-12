@@ -30,11 +30,13 @@
  Adam Sampson               YES                 makefiles
  Daniel Glöckner            NO                  arm-gen.c
  Daniel Glöckner            YES                 not arm-gen.c
+ Danny Milosavljevic        YES                 arm-asm.c
  Edmund Grimley Evans       YES                 arm64
  Fabrice Bellard            YES                 original author
  Frédéric Féret             YES                 x86 64/16 bit asm
  grischka                   YES                 tccpe.c
  Henry Kroll                YES
+ Herman ten Brugge	    YES
  Joe Soroka                 YES
  Kirill Smelkov             YES
  mingodad                   YES

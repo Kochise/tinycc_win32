@@ -259,7 +259,7 @@ static void * add_lc(struct macho *mo, uint32_t cmd, uint32_t cmdsize)
     return lc;
 }
 
-static struct segment_command_64 * add_segment(struct macho *mo, char *name)
+static struct segment_command_64 * add_segment(struct macho *mo, const char *name)
 {
     struct segment_command_64 *sc = add_lc(mo, LC_SEGMENT_64, sizeof(*sc));
     strncpy(sc->segname, name, 16);
@@ -272,7 +272,7 @@ static struct segment_command_64 * get_segment(struct macho *mo, int i)
     return (struct segment_command_64 *) (mo->lc[mo->seg2lc[i]]);
 }
 
-static int add_section(struct macho *mo, struct segment_command_64 **_seg, char *name)
+static int add_section(struct macho *mo, struct segment_command_64 **_seg, const char *name)
 {
     struct segment_command_64 *seg = *_seg;
     int ret = seg->nsects;
@@ -384,8 +384,8 @@ static int check_symbols(TCCState *s1, struct macho *mo)
         unsigned bind = ELFW(ST_BIND)(sym->st_info);
         unsigned vis  = ELFW(ST_VISIBILITY)(sym->st_other);
 
-        dprintf("%4d (%4d): %09llx %4d %4d %4d %3d %s\n",
-                sym_index, elf_index, sym->st_value,
+        dprintf("%4d (%4d): %09lx %4d %4d %4d %3d %s\n",
+                sym_index, elf_index, (long)sym->st_value,
                 type, bind, vis, sym->st_shndx, name);
         if (bind == STB_LOCAL) {
             if (mo->ilocal == -1)
@@ -525,10 +525,10 @@ static void create_symtab(TCCState *s1, struct macho *mo)
     }
 }
 
-struct {
+const struct {
     int seg;
     uint32_t flags;
-    char *name;
+    const char *name;
 } skinfo[sk_last] = {
     /*[sk_unknown] =*/  { 0 },
     /*[sk_discard] =*/  { 0 },
@@ -680,14 +680,14 @@ static void collect_sections(TCCState *s1, struct macho *mo)
             for (s = mo->sk_to_sect[sk].s; s; s = s->prev) {
                 al = s->sh_addralign;
                 curaddr = (curaddr + al - 1) & -al;
-                dprintf("curaddr now 0x%llx\n", curaddr);
+                dprintf("curaddr now 0x%lx\n", (long)curaddr);
                 s->sh_addr = curaddr;
                 curaddr += s->sh_size;
                 if (s->sh_type != SHT_NOBITS) {
                     fileofs = (fileofs + al - 1) & -al;
                     s->sh_offset = fileofs;
                     fileofs += s->sh_size;
-                    dprintf("fileofs now %lld\n", fileofs);
+                    dprintf("fileofs now %ld\n", (long)fileofs);
                 }
                 if (sec)
                   mo->elfsectomacho[s->sh_num] = numsec;
@@ -699,7 +699,7 @@ static void collect_sections(TCCState *s1, struct macho *mo)
           for (s = mo->sk_to_sect[sk].s; s; s = s->prev) {
               int type = s->sh_type;
               int flags = s->sh_flags;
-              printf("%d section %-16s %-10s %09llx %04x %02d %s,%s,%s\n",
+              printf("%d section %-16s %-10s %09lx %04x %02d %s,%s,%s\n",
                      sk,
                      s->name,
                      type == SHT_PROGBITS ? "progbits" :
@@ -709,7 +709,7 @@ static void collect_sections(TCCState *s1, struct macho *mo)
                      type == SHT_INIT_ARRAY ? "init" :
                      type == SHT_FINI_ARRAY ? "fini" :
                      type == SHT_RELX ? "rel" : "???",
-                     s->sh_addr,
+                     (long)s->sh_addr,
                      (unsigned)s->data_offset,
                      s->sh_addralign,
                      flags & SHF_ALLOC ? "alloc" : "",
@@ -809,22 +809,14 @@ ST_FUNC int macho_output_file(TCCState *s1, const char *filename)
     check_relocs(s1, &mo);
     ret = check_symbols(s1, &mo);
     if (!ret) {
-        int i;
-        Section *s;
         collect_sections(s1, &mo);
         relocate_syms(s1, s1->symtab, 0);
         mo.ep->entryoff = get_sym_addr(s1, "main", 1, 1)
                             - get_segment(&mo, 1)->vmaddr;
         if (s1->nb_errors)
           goto do_ret;
-
-        for(i = 1; i < s1->nb_sections; i++) {
-            s = s1->sections[i];
-            if (s->reloc)
-              relocate_section(s1, s);
-        }
+        relocate_sections(s1);
         convert_symbols(s1, &mo);
-
         macho_write(s1, &mo, fp);
     }
 
@@ -839,11 +831,11 @@ ST_FUNC int macho_output_file(TCCState *s1, const char *filename)
     return ret;
 }
 
-static uint32_t swap32(uint32_t x)
+static uint32_t macho_swap32(uint32_t x)
 {
   return (x >> 24) | (x << 24) | ((x >> 8) & 0xff00) | ((x & 0xff00) << 8);
 }
-#define SWAP(x) (swap ? swap32(x) : (x))
+#define SWAP(x) (swap ? macho_swap32(x) : (x))
 
 ST_FUNC int macho_load_dll(TCCState *s1, int fd, const char *filename, int lev)
 {
@@ -966,8 +958,8 @@ ST_FUNC int macho_load_dll(TCCState *s1, int fd, const char *filename, int lev)
     //for (i = 0; i < nsyms; i++) {
     for (i = iextdef; i < iextdef + nextdef; i++) {
         struct nlist_64 *sym = symtab + i;
-        dprintf("%5d: %3d %3d 0x%04x 0x%016llx %s\n",
-                i, sym->n_type, sym->n_sect, sym->n_desc, sym->n_value,
+        dprintf("%5d: %3d %3d 0x%04x 0x%016lx %s\n",
+                i, sym->n_type, sym->n_sect, sym->n_desc, (long)sym->n_value,
                 strtab + sym->n_strx);
         set_elf_sym(s1->dynsymtab_section, 0, 0,
                     ELFW(ST_INFO)(STB_GLOBAL, STT_NOTYPE),

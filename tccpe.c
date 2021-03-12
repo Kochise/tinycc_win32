@@ -20,8 +20,8 @@
 
 #include "tcc.h"
 
-#define PE_MERGE_DATA
-/* #define PE_PRINT_SECTIONS */
+#define PE_MERGE_DATA 1
+#define PE_PRINT_SECTIONS 0
 
 #ifndef _WIN32
 #define stricmp strcasecmp
@@ -35,6 +35,7 @@
 # define REL_TYPE_DIRECT R_X86_64_64
 # define R_XXX_THUNKFIX R_X86_64_PC32
 # define R_XXX_RELATIVE R_X86_64_RELATIVE
+# define R_XXX_FUNCCALL R_X86_64_PC32
 # define IMAGE_FILE_MACHINE 0x8664
 # define RSRC_RELTYPE 3
 
@@ -44,6 +45,8 @@
 # define REL_TYPE_DIRECT R_ARM_ABS32
 # define R_XXX_THUNKFIX R_ARM_ABS32
 # define R_XXX_RELATIVE R_ARM_RELATIVE
+# define R_XXX_FUNCCALL R_ARM_PC24
+# define R_XXX_FUNCCALL2 R_ARM_ABS32
 # define IMAGE_FILE_MACHINE 0x01C0
 # define RSRC_RELTYPE 7 /* ??? (not tested) */
 
@@ -53,6 +56,7 @@
 # define REL_TYPE_DIRECT R_386_32
 # define R_XXX_THUNKFIX R_386_32
 # define R_XXX_RELATIVE R_386_RELATIVE
+# define R_XXX_FUNCCALL R_386_PC32
 # define IMAGE_FILE_MACHINE 0x014C
 # define RSRC_RELTYPE 7 /* DIR32NB */
 
@@ -290,6 +294,7 @@ struct pe_rsrc_reloc {
 
 enum {
     sec_text = 0,
+    sec_rdata ,
     sec_data ,
     sec_bss ,
     sec_idata ,
@@ -721,6 +726,8 @@ static int pe_write(struct pe_info *pe)
     for (i = 0; i < pe->sec_count; ++i) {
         Section *s;
         si = pe->sec_info[i];
+        if (!si->data_size)
+            continue;
         for (s = si->sec; s; s = s->prev) {
             pe_fpad(&pf, file_offset);
             pe_fwrite(s->data, s->data_offset, &pf);
@@ -978,7 +985,7 @@ static void pe_build_exports(struct pe_info *pe)
     for (ord = 0; ord < sym_count; ++ord)
     {
         p = sorted[ord], sym_index = p->index, name = p->name;
-        /* insert actual address later in relocate_section() */
+        /* insert actual address later in relocate_sections() */
         put_elf_reloc(symtab_section, pe->thunk,
             func_o, R_XXX_RELATIVE, sym_index);
         *(DWORD*)(pe->thunk->data + name_o)
@@ -1080,6 +1087,7 @@ static int pe_section_class(Section *s)
                 return sec_idata;
             if (0 == strcmp(name, ".pdata"))
                 return sec_pdata;
+            return sec_rdata;
         } else if (type == SHT_NOBITS) {
             if (flags & SHF_WRITE)
                 return sec_bss;
@@ -1102,6 +1110,7 @@ static int pe_assign_addresses (struct pe_info *pe)
     int *section_order;
     struct section_info *si;
     Section *s;
+    TCCState *s1 = pe->s1;
 
     if (PE_DLL == pe->type)
         pe->reloc = new_section(pe->s1, ".reloc", SHT_PROGBITS, 0);
@@ -1109,8 +1118,8 @@ static int pe_assign_addresses (struct pe_info *pe)
 
     section_order = tcc_malloc(pe->s1->nb_sections * sizeof (int));
     for (o = k = 0 ; k < sec_last; ++k) {
-        for (i = 1; i < pe->s1->nb_sections; ++i) {
-            s = pe->s1->sections[i];
+        for (i = 1; i < s1->nb_sections; ++i) {
+            s = s1->sections[i];
             if (k == pe_section_class(s))
                 section_order[o++] = i;
         }
@@ -1121,16 +1130,15 @@ static int pe_assign_addresses (struct pe_info *pe)
 
     for (i = 0; i < o; ++i) {
         k = section_order[i];
-        s = pe->s1->sections[k];
+        s = s1->sections[k];
         c = pe_section_class(s);
 
-        if ((c == sec_stab || c == sec_stabstr) && 0 == pe->s1->do_debug)
+        if ((c == sec_stab || c == sec_stabstr) && 0 == s1->do_debug)
             continue;
 
-#ifdef PE_MERGE_DATA
-        if (c == sec_bss)
+        if (PE_MERGE_DATA && c == sec_bss)
             c = sec_data;
-#endif
+
         if (si && c == si->cls) {
             /* merge with previous section */
             s->sh_addr = addr = ((addr - 1) | (16 - 1)) + 1;
@@ -1139,7 +1147,8 @@ static int pe_assign_addresses (struct pe_info *pe)
             s->sh_addr = addr = pe_virtual_align(pe, addr);
         }
 
-        if (c == sec_data && NULL == pe->thunk)
+        if (NULL == pe->thunk
+            && c == (data_section == rodata_section ? sec_data : sec_rdata))
             pe->thunk = s;
 
         if (s == pe->thunk) {
@@ -1188,8 +1197,8 @@ add_section:
     }
     tcc_free(section_order);
 #if 0
-    for (i = 1; i < pe->s1->nb_sections; ++i) {
-        Section *s = pe->s1->sections[i];
+    for (i = 1; i < s1->nb_sections; ++i) {
+        Section *s = s1->sections[i];
         int type = s->sh_type;
         int flags = s->sh_flags;
         printf("section %-16s %-10s %08x %04x %s,%s,%s\n",
@@ -1206,7 +1215,7 @@ add_section:
             flags & SHF_EXECINSTR ? "exec" : ""
             );
     }
-    pe->s1->verbose = 2;
+    s1->verbose = 2;
 #endif
     return 0;
 }
@@ -1217,13 +1226,21 @@ static int pe_isafunc(TCCState *s1, int sym_index)
 {
     Section *sr = text_section->reloc;
     ElfW_Rel *rel, *rel_end;
-    Elf32_Word info = ELF32_R_INFO(sym_index, R_386_PC32);
+    ElfW(Addr)info = ELFW(R_INFO)(sym_index, R_XXX_FUNCCALL);
+#ifdef R_XXX_FUNCCALL2
+    ElfW(Addr)info2 = ELFW(R_INFO)(sym_index, R_XXX_FUNCCALL2);
+#endif
     if (!sr)
         return 0;
     rel_end = (ElfW_Rel *)(sr->data + sr->data_offset);
-    for (rel = (ElfW_Rel *)sr->data; rel < rel_end; rel++)
+    for (rel = (ElfW_Rel *)sr->data; rel < rel_end; rel++) {
         if (rel->r_info == info)
             return 1;
+#ifdef R_XXX_FUNCCALL2
+        if (rel->r_info == info2)
+            return 1;
+#endif
+    }
     return 0;
 }
 
@@ -1265,24 +1282,10 @@ static int pe_check_symbols(struct pe_info *pe)
                 unsigned long offset = is->thk_offset;
                 if (offset) {
                     /* got aliased symbol, like stricmp and _stricmp */
-
                 } else {
                     char buffer[100];
-                    WORD *p;
+                    unsigned char *p;
 
-                    offset = text_section->data_offset;
-                    /* add the 'jmp IAT[x]' instruction */
-#ifdef TCC_TARGET_ARM
-                    p = section_ptr_add(text_section, 8+4); // room for code and address
-                    (*(DWORD*)(p)) = 0xE59FC000; // arm code ldr ip, [pc] ; PC+8+0 = 0001xxxx
-                    (*(DWORD*)(p+2)) = 0xE59CF000; // arm code ldr pc, [ip]
-#else
-                    p = section_ptr_add(text_section, 8);
-                    *p = 0x25FF;
-#ifdef TCC_TARGET_X86_64
-                    *(DWORD*)(p+1) = (DWORD)-4;
-#endif
-#endif
                     /* add a helper symbol, will be patched later in
                        pe_build_imports */
                     sprintf(buffer, "IAT.%s", name);
@@ -1290,16 +1293,27 @@ static int pe_check_symbols(struct pe_info *pe)
                         symtab_section, 0, sizeof(DWORD),
                         ELFW(ST_INFO)(STB_GLOBAL, STT_OBJECT),
                         0, SHN_UNDEF, buffer);
+
+                    offset = text_section->data_offset;
+                    is->thk_offset = offset;
+
+                    /* add the 'jmp IAT[x]' instruction */
 #ifdef TCC_TARGET_ARM
+                    p = section_ptr_add(text_section, 8+4); // room for code and address
+                    write32le(p + 0, 0xE59FC000); // arm code ldr ip, [pc] ; PC+8+0 = 0001xxxx
+                    write32le(p + 4, 0xE59CF000); // arm code ldr pc, [ip]
                     put_elf_reloc(symtab_section, text_section,
                         offset + 8, R_XXX_THUNKFIX, is->iat_index); // offset to IAT position
 #else
+                    p = section_ptr_add(text_section, 8);
+                    write16le(p, 0x25FF);
+#ifdef TCC_TARGET_X86_64
+                    write32le(p + 2, (DWORD)-4);
+#endif
                     put_elf_reloc(symtab_section, text_section, 
                         offset + 2, R_XXX_THUNKFIX, is->iat_index);
 #endif
-                    is->thk_offset = offset;
                 }
-
                 /* tcc_realloc might have altered sym's address */
                 sym = (ElfW(Sym) *)symtab_section->data + sym_index;
 
@@ -1336,7 +1350,7 @@ static int pe_check_symbols(struct pe_info *pe)
 }
 
 /*----------------------------------------------------------------------------*/
-#ifdef PE_PRINT_SECTIONS
+#if PE_PRINT_SECTIONS
 static void pe_print_section(FILE * f, Section * s)
 {
     /* just if you're curious */
@@ -1519,16 +1533,13 @@ ST_FUNC int pe_putimport(TCCState *s1, int dllindex, const char *name, addr_t va
         );
 }
 
-static int add_dllref(TCCState *s1, const char *dllname)
+static int pe_add_dllref(TCCState *s1, const char *dllname)
 {
-    DLLReference *dllref;
     int i;
     for (i = 0; i < s1->nb_loaded_dlls; ++i)
         if (0 == strcmp(s1->loaded_dlls[i]->name, dllname))
             return i + 1;
-    dllref = tcc_mallocz(sizeof(DLLReference) + strlen(dllname));
-    strcpy(dllref->name, dllname);
-    dynarray_add(&s1->loaded_dlls, &s1->nb_loaded_dlls, dllref);
+    tcc_add_dllref(s1, dllname);
     return s1->nb_loaded_dlls;
 }
 
@@ -1725,7 +1736,7 @@ static int pe_load_def(TCCState *s1, int fd)
             continue;
 
         case 2:
-            dllindex = add_dllref(s1, dllname);
+            dllindex = pe_add_dllref(s1, dllname);
             ++state;
             /* fall through */
         default:
@@ -1761,7 +1772,7 @@ static int pe_load_dll(TCCState *s1, const char *filename)
     if (ret) {
         return -1;
     } else if (p) {
-        index = add_dllref(s1, filename);
+        index = pe_add_dllref(s1, filename);
         for (q = p; *q; q += 1 + strlen(q))
             pe_putimport(s1, index, q, 0);
         tcc_free(p);
@@ -1770,7 +1781,7 @@ static int pe_load_dll(TCCState *s1, const char *filename)
 }
 
 /* ------------------------------------------------------------- */
-ST_FUNC int pe_load_file(struct TCCState *s1, const char *filename, int fd)
+ST_FUNC int pe_load_file(struct TCCState *s1, int fd, const char *filename)
 {
     int ret = -1;
     char buf[10];
@@ -1917,11 +1928,11 @@ static void pe_add_runtime(TCCState *s1, struct pe_info *pe)
     set_global_sym(s1, start_symbol, NULL, 0);
 
     if (0 == s1->nostdlib) {
-        static const char *libs[] = {
+        static const char * const libs[] = {
             "msvcrt", "kernel32", "", "user32", "gdi32", NULL
         };
-        const char **pp, *p;
-        if (strlen(TCC_LIBTCC1) > 0)
+        const char * const *pp, *p;
+        if (TCC_LIBTCC1[0])
             tcc_add_support(s1, TCC_LIBTCC1);
         for (pp = libs; 0 != (p = *pp); ++pp) {
             if (*p)
@@ -1931,7 +1942,7 @@ static void pe_add_runtime(TCCState *s1, struct pe_info *pe)
         }
     }
 
-    /* need this for 'tccelf.c:relocate_section()' */
+    /* need this for 'tccelf.c:relocate_sections()' */
     if (TCC_OUTPUT_DLL == s1->output_type)
         s1->output_type = TCC_OUTPUT_EXE;
     if (TCC_OUTPUT_MEMORY == s1->output_type)
@@ -1990,7 +2001,6 @@ ST_FUNC int pe_output_file(TCCState *s1, const char *filename)
 {
     int ret;
     struct pe_info pe;
-    int i;
 
     memset(&pe, 0, sizeof pe);
     pe.filename = filename;
@@ -2012,12 +2022,7 @@ ST_FUNC int pe_output_file(TCCState *s1, const char *filename)
         pe_assign_addresses(&pe);
         relocate_syms(s1, s1->symtab, 0);
         s1->pe_imagebase = pe.imagebase;
-        for (i = 1; i < s1->nb_sections; ++i) {
-            Section *s = s1->sections[i];
-            if (s->reloc) {
-                relocate_section(s1, s);
-            }
-        }
+        relocate_sections(s1);
         pe.start_addr = (DWORD)
             (get_sym_addr(s1, pe.start_symbol, 1, 1) - pe.imagebase);
         if (s1->nb_errors)
@@ -2038,8 +2043,9 @@ ST_FUNC int pe_output_file(TCCState *s1, const char *filename)
 
     pe_free_imports(&pe);
 
-#ifdef PE_PRINT_SECTIONS
-    pe_print_sections(s1, "tcc.log");
+#if PE_PRINT_SECTIONS
+    if (s1->g_debug & 8)
+        pe_print_sections(s1, "tcc.log");
 #endif
     return ret;
 }

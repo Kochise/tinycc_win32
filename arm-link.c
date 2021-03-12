@@ -12,8 +12,8 @@
 
 #define R_NUM       R_ARM_NUM
 
-#define ELF_START_ADDR 0x00008000
-#define ELF_PAGE_SIZE  0x1000
+#define ELF_START_ADDR 0x00010000
+#define ELF_PAGE_SIZE  0x10000
 
 #define PCRELATIVE_DLLPLT 1
 #define RELOCATE_DLLPLT 1
@@ -41,9 +41,13 @@ int code_reloc (int reloc_type)
 	case R_ARM_GOTPC:
 	case R_ARM_GOTOFF:
 	case R_ARM_GOT32:
+	case R_ARM_GOT_PREL:
 	case R_ARM_COPY:
 	case R_ARM_GLOB_DAT:
 	case R_ARM_NONE:
+	case R_ARM_TARGET1:
+	case R_ARM_MOVT_PREL:
+	case R_ARM_MOVW_PREL_NC:
             return 0;
 
         case R_ARM_PC24:
@@ -86,6 +90,9 @@ int gotplt_entry_type (int reloc_type)
 	case R_ARM_ABS32:
 	case R_ARM_REL32:
 	case R_ARM_V4BX:
+	case R_ARM_TARGET1:
+	case R_ARM_MOVT_PREL:
+	case R_ARM_MOVW_PREL_NC:
             return AUTO_GOTPLT_ENTRY;
 
 	case R_ARM_GOTPC:
@@ -93,6 +100,7 @@ int gotplt_entry_type (int reloc_type)
             return BUILD_GOT_ONLY;
 
 	case R_ARM_GOT32:
+	case R_ARM_GOT_PREL:
             return ALWAYS_GOTPLT_ENTRY;
     }
     return -1;
@@ -125,7 +133,7 @@ ST_FUNC unsigned create_plt_entry(TCCState *s1, unsigned got_offset, struct sym_
         write32le(p,   0x4778); /* bx pc */
         write32le(p+2, 0x46c0); /* nop   */
     }
-    p = section_ptr_add(plt, 12);
+    p = section_ptr_add(plt, 16);
     /* save GOT offset for relocate_plt */
     write32le(p + 4, got_offset);
     return plt_offset;
@@ -145,17 +153,26 @@ ST_FUNC void relocate_plt(TCCState *s1)
 
     if (p < p_end) {
         int x = s1->got->sh_addr - s1->plt->sh_addr - 12;
-        write32le(s1->plt->data + 16, x - 16);
+        write32le(s1->plt->data + 16, x - 4);
         p += 20;
         while (p < p_end) {
 	    unsigned off = x  + read32le(p + 4) + (s1->plt->data - p) + 4;
             if (read32le(p) == 0x46c04778) /* PLT Thumb stub present */
                 p += 4;
-            write32le(p, 0xe28fc600 | ((off >> 20) & 0xff));     // add ip, pc, #0xNN00000
-            write32le(p + 4, 0xe28cca00 | ((off >> 12) & 0xff)); // add ip, ip, #0xNN000
-            write32le(p + 8, 0xe5bcf000 | (off & 0xfff));	 // ldr pc, [ip, #0xNNN]!
-            p += 12;
+            write32le(p, 0xe28fc200 | ((off >> 28) & 0xf));      // add ip, pc, #0xN0000000
+            write32le(p + 4, 0xe28cc600 | ((off >> 20) & 0xff)); // add ip, pc, #0xNN00000
+            write32le(p + 8, 0xe28cca00 | ((off >> 12) & 0xff)); // add ip, ip, #0xNN000
+            write32le(p + 12, 0xe5bcf000 | (off & 0xfff));	 // ldr pc, [ip, #0xNNN]!
+            p += 16;
         }
+    }
+
+    if (s1->plt->reloc) {
+        ElfW_Rel *rel;
+        p = s1->got->data;
+        for_each_elem(s1->plt->reloc, 0, rel, ElfW_Rel) {
+            write32le(p + rel->r_offset, s1->plt->sh_addr);
+	}
     }
 }
 #endif
@@ -316,6 +333,20 @@ void relocate(TCCState *s1, ElfW_Rel *rel, int type, unsigned char *ptr, addr_t 
                     *(int *)ptr += x;
             }
             return;
+        case R_ARM_MOVT_PREL:
+        case R_ARM_MOVW_PREL_NC:
+            {
+		int insn = *(int *)ptr;
+                int addend = ((insn >> 4) & 0xf000) | (insn & 0xfff);
+
+		addend = (addend ^ 0x8000) - 0x8000;
+		val += addend - addr;
+		if (type == R_ARM_MOVT_PREL)
+		    val >>= 16;
+		*(int *)ptr = (insn & 0xfff0f000) |
+			      ((val & 0xf000) << 4) | (val & 0xfff);
+            }
+            return;
         case R_ARM_THM_MOVT_ABS:
         case R_ARM_THM_MOVW_ABS_NC:
             {
@@ -344,7 +375,9 @@ void relocate(TCCState *s1, ElfW_Rel *rel, int type, unsigned char *ptr, addr_t 
                     tcc_error("can't relocate value at %x,%d",addr, type);
                 (*(int *)ptr) |= x & 0x7fffffff;
             }
+            return;
         case R_ARM_ABS32:
+        case R_ARM_TARGET1:
             if (s1->output_type == TCC_OUTPUT_DLL) {
                 esym_index = get_sym_attr(s1, sym_index, 0)->dyn_index;
                 qrel->r_offset = rel->r_offset;
@@ -372,6 +405,12 @@ void relocate(TCCState *s1, ElfW_Rel *rel, int type, unsigned char *ptr, addr_t 
             /* we load the got offset */
             *(int *)ptr += get_sym_attr(s1, sym_index, 0)->got_offset;
             return;
+	case R_ARM_GOT_PREL:
+            /* we load the pc relative got offset */
+            *(int *)ptr += s1->got->sh_addr +
+			   get_sym_attr(s1, sym_index, 0)->got_offset -
+			   addr;
+            return;
         case R_ARM_COPY:
             return;
         case R_ARM_V4BX:
@@ -394,7 +433,7 @@ void relocate(TCCState *s1, ElfW_Rel *rel, int type, unsigned char *ptr, addr_t 
             /* do nothing */
             return;
         default:
-            fprintf(stderr,"FIXME: handle reloc type %x at %x [%p] to %x\n",
+            fprintf(stderr,"FIXME: handle reloc type %d at %x [%p] to %x\n",
                 type, (unsigned)addr, ptr, (unsigned)val);
             return;
     }

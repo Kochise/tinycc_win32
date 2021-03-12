@@ -112,6 +112,11 @@ enum {
 #include "tcc.h"
 #include <assert.h>
 
+ST_DATA const char * const target_machine_defs =
+    "__x86_64__\0"
+    "__amd64__\0"
+    ;
+
 ST_DATA const int reg_classes[NB_REGS] = {
     /* eax */ RC_INT | RC_RAX,
     /* ecx */ RC_INT | RC_RCX,
@@ -570,7 +575,9 @@ void store(int r, SValue *v)
 
 #ifndef TCC_TARGET_PE
     /* we need to access the variable via got */
-    if (fr == VT_CONST && (v->r & VT_SYM)) {
+    if (fr == VT_CONST
+        && (v->r & VT_SYM)
+        && !(v->sym->type.t & VT_STATIC)) {
         /* mov xx(%rip), %r11 */
         o(0x1d8b4c);
         gen_gotpcrel(TREG_R11, v->sym, v->c.i);
@@ -653,7 +660,7 @@ static void gcall_or_jmp(int is_jmp)
 
 static void gen_bounds_call(int v)
 {
-    Sym *sym = external_global_sym(v, &func_old_type);
+    Sym *sym = external_helper_sym(v);
     oad(0xe8, 0);
 #ifdef TCC_TARGET_PE
     greloca(cur_text_section, sym, ind-4, R_X86_64_PC32, -4);
@@ -674,8 +681,8 @@ static void gen_bounds_prolog(void)
     func_bound_offset = lbounds_section->data_offset;
     func_bound_ind = ind;
     func_bound_add_epilog = 0;
-    o(0xb848 + TREG_FASTCALL_1 * 0x100); /*lbound section pointer */
-    gen_le64 (0);
+    o(0x0d8d48 + ((TREG_FASTCALL_1 == TREG_RDI) * 0x300000)); /*lbound section pointer */
+    gen_le32 (0);
     oad(0xb8, 0); /* call to function */
 }
 
@@ -700,17 +707,17 @@ static void gen_bounds_epilog(void)
     if (offset_modified) {
         saved_ind = ind;
         ind = func_bound_ind;
-        greloca(cur_text_section, sym_data, ind + 2, R_X86_64_64, 0);
-        ind = ind + 10;
+        greloca(cur_text_section, sym_data, ind + 3, R_X86_64_PC32, -4);
+        ind = ind + 7;
         gen_bounds_call(TOK___bound_local_new);
         ind = saved_ind;
     }
 
     /* generate bound check local freeing */
     o(0x5250); /* save returned value, if any */
-    greloca(cur_text_section, sym_data, ind + 2, R_X86_64_64, 0);
-    o(0xb848 + TREG_FASTCALL_1 * 0x100); /* mov xxx, %rcx/di */
-    gen_le64 (0);
+    greloca(cur_text_section, sym_data, ind + 3, R_X86_64_PC32, -4);
+    o(0x0d8d48 + ((TREG_FASTCALL_1 == TREG_RDI) * 0x300000)); /* lea xxx(%rip), %rcx/rdi */
+    gen_le32 (0);
     gen_bounds_call(TOK___bound_local_delete);
     o(0x585a); /* restore returned value, if any */
 }
@@ -730,7 +737,7 @@ static int arg_prepare_reg(int idx) {
       /* idx=0: r10, idx=1: r11 */
       return idx + 10;
   else
-      return arg_regs[idx];
+      return idx >= 0 && idx < REGN ? arg_regs[idx] : 0;
 }
 
 /* Generate function call. The function address is pushed first, then
@@ -1022,7 +1029,7 @@ void gfunc_epilog(void)
     v = -loc;
 
     if (v >= 4096) {
-        Sym *sym = external_global_sym(TOK___chkstk, &func_old_type);
+        Sym *sym = external_helper_sym(TOK___chkstk);
         oad(0xb8, v); /* mov stacksize, %eax */
         oad(0xe8, 0); /* call __chkstk, (does the stackframe too) */
         greloca(cur_text_section, sym, ind-4, R_X86_64_PC32, -4);
@@ -1216,7 +1223,7 @@ static int arg_prepare_reg(int idx) {
       /* idx=2: r10, idx=3: r11 */
       return idx + 8;
   else
-      return arg_regs[idx];
+      return idx >= 0 && idx < REGN ? arg_regs[idx] : 0;
 }
 
 /* Generate function call. The function address is pushed first, then
@@ -1808,14 +1815,38 @@ void gen_opl(int op)
     gen_opi(op);
 }
 
+void vpush_const(int t, int v)
+{
+    CType ctype = { t | VT_CONSTANT, 0 };
+    vpushsym(&ctype, external_global_sym(v, &ctype));
+    vtop->r |= VT_LVAL;
+}
+
 /* generate a floating point operation 'v = t1 op t2' instruction. The
    two operands are guaranteed to have the same floating point type */
 /* XXX: need to use ST1 too */
 void gen_opf(int op)
 {
     int a, ft, fc, swapped, r;
-    int float_type =
-        (vtop->type.t & VT_BTYPE) == VT_LDOUBLE ? RC_ST0 : RC_FLOAT;
+    int bt = vtop->type.t & VT_BTYPE;
+    int float_type = bt == VT_LDOUBLE ? RC_ST0 : RC_FLOAT;
+
+    if (op == TOK_NEG) { /* unary minus */
+        gv(float_type);
+        if (float_type == RC_ST0) {
+            o(0xe0d9); /* fchs */
+        } else {
+            /* -0.0, in libtcc1.c */
+            vpush_const(bt, bt == VT_FLOAT ? TOK___mzerosf : TOK___mzerodf);
+            gv(RC_FLOAT);
+            if (bt == VT_DOUBLE)
+                o(0x66);
+            /* xorp[sd] %xmm1, %xmm0 */
+            o(0xc0570f | (REG_VALUE(vtop[0].r) + REG_VALUE(vtop[-1].r)*8) << 16);
+            vtop--;
+        }
+        return;
+    }
 
     /* convert constants to memory references */
     if ((vtop[-1].r & (VT_VALMASK | VT_LVAL)) == VT_CONST) {
@@ -2171,6 +2202,15 @@ ST_FUNC void gen_cvt_csti(int t)
         );
 }
 
+/* increment tcov counter */
+ST_FUNC void gen_increment_tcov (SValue *sv)
+{
+   o(0x058348); /* addq $1, xxx(%rip) */
+   greloca(cur_text_section, sv->sym, ind, R_X86_64_PC32, -5);
+   gen_le32(0);
+   o(1);
+}
+
 /* computed goto support */
 void ggoto(void)
 {
@@ -2209,7 +2249,7 @@ ST_FUNC void gen_vla_alloc(CType *type, int align) {
 #endif
     if (use_call)
     {
-        vpush_global_sym(&func_old_type, TOK_alloca);
+        vpush_helper_func(TOK_alloca);
         vswap(); /* Move alloca ref past allocation size */
         gfunc_call(1);
     }

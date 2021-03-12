@@ -129,11 +129,32 @@ enum {
 
 #define CHAR_IS_UNSIGNED
 
+#ifdef TCC_ARM_HARDFLOAT
+# define ARM_FLOAT_ABI ARM_HARD_FLOAT
+#else
+# define ARM_FLOAT_ABI ARM_SOFTFP_FLOAT
+#endif
+
 /******************************************************/
 #else /* ! TARGET_DEFS_ONLY */
 /******************************************************/
 #define USING_GLOBALS
 #include "tcc.h"
+
+ST_DATA const char * const target_machine_defs =
+    "__arm__\0"
+    "__arm\0"
+    "arm\0"
+    "__arm_elf__\0"
+    "__arm_elf\0"
+    "arm_elf\0"
+    "__ARM_ARCH_4__\0"
+    "__ARMEL__\0"
+    "__APCS_32__\0"
+#if defined TCC_ARM_EABI
+    "__ARM_EABI__\0"
+#endif
+    ;
 
 enum float_abi float_abi;
 
@@ -177,7 +198,8 @@ ST_FUNC void arm_init(struct TCCState *s)
 
     float_abi = s->float_abi;
 #ifndef TCC_ARM_HARDFLOAT
-# warning "soft float ABI currently not supported: default to softfp"
+// XXX: Works on OpenBSD
+// # warning "soft float ABI currently not supported: default to softfp"
 #endif
 }
 #else
@@ -515,6 +537,38 @@ static int negcc(int cc)
   return TOK_NE;
 }
 
+/* Load value into register r.
+   Use relative/got addressing to avoid setting DT_TEXTREL */
+static void load_value(SValue *sv, int r)
+{
+    o(0xE59F0000|(intr(r)<<12)); /* ldr r, [pc] */
+    o(0xEA000000); /* b $+4 */
+#ifndef CONFIG_TCC_PIE
+    if(sv->r & VT_SYM)
+        greloc(cur_text_section, sv->sym, ind, R_ARM_ABS32);
+    o(sv->c.i);
+#else
+    if(sv->r & VT_SYM) {
+	if (sv->sym->type.t & VT_STATIC) {
+            greloc(cur_text_section, sv->sym, ind, R_ARM_REL32);
+            o(sv->c.i - 12);
+            o(0xe080000f | (intr(r)<<12) | (intr(r)<<16));  // add rx,rx,pc
+        }
+        else {
+            greloc(cur_text_section, sv->sym, ind, R_ARM_GOT_PREL);
+            o(-12);
+            o(0xe080000f | (intr(r)<<12) | (intr(r)<<16));  // add rx,rx,pc
+            o(0xe5900000 | (intr(r)<<12) | (intr(r)<<16));  // ldr rx,[rx]
+            if (sv->c.i)
+              stuff_const_harder(0xe2800000 | (intr(r)<<12) | (intr(r)<<16),
+                                 sv->c.i);
+        }
+    }
+    else
+        o(sv->c.i);
+#endif
+}
+
 /* load 'r' from value 'sv' */
 void load(int r, SValue *sv)
 {
@@ -608,23 +662,15 @@ void load(int r, SValue *sv)
   } else {
     if (v == VT_CONST) {
       op=stuff_const(0xE3A00000|(intr(r)<<12),sv->c.i);
-      if (fr & VT_SYM || !op) {
-        o(0xE59F0000|(intr(r)<<12));
-        o(0xEA000000);
-        if(fr & VT_SYM)
-	  greloc(cur_text_section, sv->sym, ind, R_ARM_ABS32);
-        o(sv->c.i);
-      } else
+      if (fr & VT_SYM || !op)
+	load_value(sv, r);
+      else
         o(op);
       return;
     } else if (v == VT_LOCAL) {
       op=stuff_const(0xE28B0000|(intr(r)<<12),sv->c.i);
       if (fr & VT_SYM || !op) {
-	o(0xE59F0000|(intr(r)<<12));
-	o(0xEA000000);
-	if(fr & VT_SYM) // needed ?
-	  greloc(cur_text_section, sv->sym, ind, R_ARM_ABS32);
-	o(sv->c.i);
+	load_value(sv, r);
 	o(0xE08B0000|(intr(r)<<12)|intr(r));
       } else
 	o(op);
@@ -750,25 +796,26 @@ static void gcall_or_jmp(int is_jmp)
   uint32_t x;
   if ((vtop->r & (VT_VALMASK | VT_LVAL)) == VT_CONST) {
     /* constant case */
-	if(vtop->r & VT_SYM){
-		x=encbranch(ind,ind+vtop->c.i,0);
-		if(x) {
-		/* relocation case */
-		  greloc(cur_text_section, vtop->sym, ind, R_ARM_PC24);
-		  o(x|(is_jmp?0xE0000000:0xE1000000));
-		} else {
-			if(!is_jmp)
-				o(0xE28FE004); // add lr,pc,#4
-			o(0xE51FF004);   // ldr pc,[pc,#-4]
-			greloc(cur_text_section, vtop->sym, ind, R_ARM_ABS32);
-			o(vtop->c.i);
-		}
-	}else{
-		if(!is_jmp)
-			o(0xE28FE004); // add lr,pc,#4
-		o(0xE51FF004);   // ldr pc,[pc,#-4]
-		o(vtop->c.i);
+    if(vtop->r & VT_SYM){
+	x=encbranch(ind,ind+vtop->c.i,0);
+	if(x) {
+	    /* relocation case */
+	    greloc(cur_text_section, vtop->sym, ind, R_ARM_PC24);
+	    o(x|(is_jmp?0xE0000000:0xE1000000));
+	} else {
+	    r = TREG_LR;
+	    load_value(vtop, r);
+	    if(is_jmp)
+	        o(0xE1A0F000 | intr(r)); // mov pc, r
+	    else
+		o(0xe12fff30 | intr(r)); // blx r
 	}
+     }else{
+	if(!is_jmp)
+	    o(0xE28FE004); // add lr,pc,#4
+	o(0xE51FF004);   // ldr pc,[pc,#-4]
+	o(vtop->c.i);
+     }
   } else {
     /* otherwise, indirect call */
 #ifdef CONFIG_TCC_BCHECK
@@ -785,7 +832,7 @@ static void gcall_or_jmp(int is_jmp)
 
 static void gen_bounds_call(int v)
 {
-    Sym *sym = external_global_sym(v, &func_old_type);
+    Sym *sym = external_helper_sym(v);
 
     greloc(cur_text_section, sym, ind, R_ARM_PC24);
     o(0xebfffffe);
@@ -798,6 +845,7 @@ static void gen_bounds_prolog(void)
     func_bound_ind = ind;
     func_bound_add_epilog = 0;
     o(0xe1a00000);  /* ld r0,lbounds_section->data_offset */
+    o(0xe1a00000);
     o(0xe1a00000);
     o(0xe1a00000);
     o(0xe1a00000);  /* call __bound_local_new */
@@ -826,8 +874,9 @@ static void gen_bounds_epilog(void)
         ind = func_bound_ind;
         o(0xe59f0000);  /* ldr r0, [pc] */
         o(0xea000000);  /* b $+4 */
-        greloc(cur_text_section, sym_data, ind, R_ARM_ABS32);
-        o(0x00000000);  /* lbounds_section->data_offset */
+        greloc(cur_text_section, sym_data, ind, R_ARM_REL32);
+        o(-12);  /* lbounds_section->data_offset */
+	o(0xe080000f);  /* add r0,r0,pc */
         gen_bounds_call(TOK___bound_local_new);
         ind = saved_ind;
     }
@@ -837,8 +886,9 @@ static void gen_bounds_epilog(void)
     o(0xed2d0b02);  /* vpush {d0} */
     o(0xe59f0000);  /* ldr r0, [pc] */
     o(0xea000000);  /* b $+4 */
-    greloc(cur_text_section, sym_data, ind, R_ARM_ABS32);
-    o(0x00000000);  /* lbounds_section->data_offset */
+    greloc(cur_text_section, sym_data, ind, R_ARM_REL32);
+    o(-12);  /* lbounds_section->data_offset */
+    o(0xe080000f);  /* add r0,r0,pc */
     gen_bounds_call(TOK___bound_local_delete);
     o(0xecbd0b02); /* vpop {d0} */
     o(0xe8bd0003); /* pop {r0,r1} */
@@ -1160,7 +1210,10 @@ again:
             o(0xE28D0000|(intr(r)<<12)|padding); /* add r, sp, padding */
             vset(&vtop->type, r | VT_LVAL, 0);
             vswap();
+	    /* XXX: optimize. Save all register because memcpy can use them */
+	    o(0xED2D0A00|(0&1)<<22|(0>>1)<<12|16); /* vpush {s0-s15} */
             vstore(); /* memcpy to current sp + potential padding */
+	    o(0xECBD0A00|(0&1)<<22|(0>>1)<<12|16); /* vpop {s0-s15} */
 
             /* Homogeneous float aggregate are loaded to VFP registers
                immediately since there is no way of loading data in multiple
@@ -1674,19 +1727,29 @@ void gen_opi(int op)
 	uint32_t x;
 	x=stuff_const(opc|0x2000000|(c<<16),vtop->c.i);
 	if(x) {
-	  r=intr(vtop[-1].r=get_reg_ex(RC_INT,regmask(vtop[-1].r)));
-	  o(x|(r<<12));
+	  if ((x & 0xfff00000) == 0xe3500000)   // cmp rx,#c
+	    o(x);
+	  else {
+	    r=intr(vtop[-1].r=get_reg_ex(RC_INT,regmask(vtop[-1].r)));
+	    o(x|(r<<12));
+	  }
 	  goto done;
 	}
       }
       fr=intr(gv(RC_INT));
+#ifdef CONFIG_TCC_BCHECK
       if ((vtop[-1].r & VT_VALMASK) >= VT_CONST) {
         vswap();
         c=intr(gv(RC_INT));
         vswap();
       }
-      r=intr(vtop[-1].r=get_reg_ex(RC_INT,two2mask(vtop->r,vtop[-1].r)));
-      o(opc|(c<<16)|(r<<12)|fr);
+#endif
+      if ((opc & 0xfff00000) == 0xe1500000) // cmp rx,ry
+	o(opc|(c<<16)|fr);
+      else {
+        r=intr(vtop[-1].r=get_reg_ex(RC_INT,two2mask(vtop->r,vtop[-1].r)));
+        o(opc|(c<<16)|(r<<12)|fr);
+      }
 done:
       vtop--;
       if (op >= TOK_ULT && op <= TOK_GT)
@@ -1706,18 +1769,20 @@ done:
 	o(opc|r|(c<<7)|(fr<<12));
       } else {
         fr=intr(gv(RC_INT));
+#ifdef CONFIG_TCC_BCHECK
         if ((vtop[-1].r & VT_VALMASK) >= VT_CONST) {
           vswap();
           r=intr(gv(RC_INT));
           vswap();
         }
+#endif
 	c=intr(vtop[-1].r=get_reg_ex(RC_INT,two2mask(vtop->r,vtop[-1].r)));
 	o(opc|r|(c<<12)|(fr<<8)|0x10);
       }
       vtop--;
       break;
     case 3:
-      vpush_global_sym(&func_old_type, func);
+      vpush_helper_func(func);
       vrott(3);
       gfunc_call(2);
       vpushi(0);
@@ -1822,12 +1887,14 @@ void gen_opf(int op)
     r2=gv(RC_FLOAT);
     x|=vfpr(r2)<<16;
     r|=regmask(r2);
+#ifdef CONFIG_TCC_BCHECK
     if ((vtop[-1].r & VT_VALMASK) >= VT_CONST) {
       vswap();
       r=gv(RC_FLOAT);
       vswap();
       x=(x&~0xf)|vfpr(r);
     }
+#endif
   }
   vtop->r=get_reg_ex(RC_FLOAT,r);
   if(!fneg)
@@ -1910,11 +1977,13 @@ void gen_opf(int op)
 	r2=c2&0xf;
       } else {
 	r2=fpr(gv(RC_FLOAT));
+#ifdef CONFIG_TCC_BCHECK
         if ((vtop[-1].r & VT_VALMASK) >= VT_CONST) {
           vswap();
           r=fpr(gv(RC_FLOAT));
           vswap();
         }
+#endif
       }
       break;
     case '-':
@@ -1936,11 +2005,13 @@ void gen_opf(int op)
 	r=fpr(gv(RC_FLOAT));
 	vswap();
 	r2=fpr(gv(RC_FLOAT));
+#ifdef CONFIG_TCC_BCHECK
         if ((vtop[-1].r & VT_VALMASK) >= VT_CONST) {
           vswap();
           r=fpr(gv(RC_FLOAT));
           vswap();
         }
+#endif
       }
       break;
     case '*':
@@ -1955,11 +2026,13 @@ void gen_opf(int op)
 	r2=c2;
       else {
 	r2=fpr(gv(RC_FLOAT));
+#ifdef CONFIG_TCC_BCHECK
         if ((vtop[-1].r & VT_VALMASK) >= VT_CONST) {
           vswap();
           r=fpr(gv(RC_FLOAT));
           vswap();
         }
+#endif
       }
       x|=0x100000; // muf
       break;
@@ -1981,11 +2054,13 @@ void gen_opf(int op)
 	r=fpr(gv(RC_FLOAT));
 	vswap();
 	r2=fpr(gv(RC_FLOAT));
+#ifdef CONFIG_TCC_BCHECK
         if ((vtop[-1].r & VT_VALMASK) >= VT_CONST) {
           vswap();
           r=fpr(gv(RC_FLOAT));
           vswap();
         }
+#endif
       }
       break;
     default:
@@ -2038,11 +2113,13 @@ void gen_opf(int op)
 	  r2=c2&0xf;
 	} else {
 	  r2=fpr(gv(RC_FLOAT));
+#ifdef CONFIG_TCC_BCHECK
           if ((vtop[-1].r & VT_VALMASK) >= VT_CONST) {
             vswap();
             r=fpr(gv(RC_FLOAT));
             vswap();
           }
+#endif
 	}
         --vtop;
         vset_VT_CMP(op);
@@ -2137,7 +2214,7 @@ ST_FUNC void gen_cvt_itof(int t)
         func=TOK___floatdidf;
     }
     if(func_type) {
-      vpush_global_sym(func_type, func);
+      vpushsym(func_type, external_helper_sym(func));
       vswap();
       gfunc_call(1);
       vpushi(0);
@@ -2196,7 +2273,7 @@ void gen_cvt_ftoi(int t)
       func=TOK___fixdfdi;
   }
   if(func) {
-    vpush_global_sym(&func_old_type, func);
+    vpush_helper_func(func);
     vswap();
     gfunc_call(1);
     vpushi(0);
@@ -2220,6 +2297,29 @@ void gen_cvt_ftof(int t)
   /* all we have to do on i386 and FPA ARM is to put the float in a register */
   gv(RC_FLOAT);
 #endif
+}
+
+/* increment tcov counter */
+ST_FUNC void gen_increment_tcov (SValue *sv)
+{
+  int r1, r2;
+
+  vpushv(sv);
+  vtop->r = r1 = get_reg(RC_INT);
+  r2 = get_reg(RC_INT);
+  o(0xE59F0000 | (intr(r1)<<12)); // ldr r1,[pc]
+  o(0xEA000000); // b $+4
+  greloc(cur_text_section, sv->sym, ind, R_ARM_REL32);
+  o(-12);
+  o(0xe080000f | (intr(r1)<<16) | (intr(r1)<<12)); // add r1,r1,pc
+  o(0xe5900000 | (intr(r1)<<16) | (intr(r2)<<12)); // ldr r2, [r1]
+  o(0xe2900001 | (intr(r2)<<16) | (intr(r2)<<12)); // adds r2, r2, #1
+  o(0xe5800000 | (intr(r1)<<16) | (intr(r2)<<12)); // str r2, [r1]
+  o(0xe2800004 | (intr(r1)<<16) | (intr(r1)<<12)); // add r1, r1, #4
+  o(0xe5900000 | (intr(r1)<<16) | (intr(r2)<<12)); // ldr r2, [r1]
+  o(0xe2a00000 | (intr(r2)<<16) | (intr(r2)<<12)); // adc r2, r2, #0
+  o(0xe5800000 | (intr(r1)<<16) | (intr(r2)<<12)); // str r2, [r1]
+  vpop();
 }
 
 /* computed goto support */
@@ -2277,7 +2377,7 @@ ST_FUNC void gen_vla_alloc(CType *type, int align) {
         vtop->r = TREG_R0;
         o(0xe1a0000d | (vtop->r << 12)); // mov r0,sp
         vswap();
-        vpush_global_sym(&func_old_type, TOK___bound_new_region);
+        vpush_helper_func(TOK___bound_new_region);
         vrott(3);
         gfunc_call(2);
         func_bound_add_epilog = 1;

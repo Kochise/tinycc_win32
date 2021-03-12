@@ -70,11 +70,6 @@ TCCFLAGS-win = -B$(TOPSRC)/win32 -I$(TOPSRC)/include -I$(TOPSRC) -I$(TOP) -L$(TO
 TCCFLAGS = $(TCCFLAGS$(CFG))
 TCC = $(TOP)/tcc$(EXESUF) $(TCCFLAGS)
 
-# cross compiler targets to build
-TCC_X = i386 x86_64 i386-win32 x86_64-win32 x86_64-osx arm arm64 arm-wince c67
-TCC_X += riscv64
-# TCC_X += arm-fpa arm-fpa-ld arm-vfp arm-eabi
-
 CFLAGS_P = $(CFLAGS) -pg -static -DCONFIG_TCC_STATIC -DTCC_PROFILE
 LIBS_P = $(LIBS)
 LDFLAGS_P = $(LDFLAGS)
@@ -94,7 +89,38 @@ NATIVE_DEFINES_$(CONFIG_arm_eabi) += -DTCC_ARM_EABI
 NATIVE_DEFINES_$(CONFIG_arm_vfp) += -DTCC_ARM_VFP
 NATIVE_DEFINES_$(CONFIG_arm64) += -DTCC_TARGET_ARM64
 NATIVE_DEFINES_$(CONFIG_riscv64) += -DTCC_TARGET_RISCV64
-NATIVE_DEFINES += $(NATIVE_DEFINES_yes)
+NATIVE_DEFINES_$(CONFIG_BSD) += -DTARGETOS_$(TARGETOS)
+NATIVE_DEFINES_$(CONFIG_pie) += -DCONFIG_TCC_PIE
+NATIVE_DEFINES_no_$(CONFIG_bcheck) += -DCONFIG_TCC_BCHECK=0
+NATIVE_DEFINES_no_$(CONFIG_backtrace) += -DCONFIG_TCC_BACKTRACE=0
+NATIVE_DEFINES += $(NATIVE_DEFINES_yes) $(NATIVE_DEFINES_no_no)
+
+DEF-i386           = -DTCC_TARGET_I386
+DEF-i386-win32     = -DTCC_TARGET_I386 -DTCC_TARGET_PE
+DEF-i386-OpenBSD   = $(DEF-i386) -DTARGETOS_OpenBSD
+DEF-x86_64         = -DTCC_TARGET_X86_64
+DEF-x86_64-win32   = -DTCC_TARGET_X86_64 -DTCC_TARGET_PE
+DEF-x86_64-osx     = -DTCC_TARGET_X86_64 -DTCC_TARGET_MACHO
+DEF-arm-fpa        = -DTCC_TARGET_ARM
+DEF-arm-fpa-ld     = -DTCC_TARGET_ARM -DLDOUBLE_SIZE=12
+DEF-arm-vfp        = -DTCC_TARGET_ARM -DTCC_ARM_VFP
+DEF-arm-eabi       = -DTCC_TARGET_ARM -DTCC_ARM_VFP -DTCC_ARM_EABI
+DEF-arm-eabihf     = $(DEF-arm-eabi) -DTCC_ARM_HARDFLOAT
+DEF-arm            = $(DEF-arm-eabihf)
+DEF-arm-NetBSD     = $(DEF-arm-eabihf) -DTARGETOS_NetBSD
+DEF-arm-wince      = $(DEF-arm-eabihf) -DTCC_TARGET_PE
+DEF-arm64          = -DTCC_TARGET_ARM64
+DEF-arm64-osx      = $(DEF-arm64) -DTCC_TARGET_MACHO
+DEF-arm64-FreeBSD  = $(DEF-arm64) -DTARGETOS_FreeBSD
+DEF-arm64-NetBSD   = $(DEF-arm64) -DTARGETOS_NetBSD
+DEF-arm64-OpenBSD  = $(DEF-arm64) -DTARGETOS_OpenBSD
+DEF-riscv64        = -DTCC_TARGET_RISCV64
+DEF-c67            = -DTCC_TARGET_C67 -w # disable warnigs
+DEF-x86_64-FreeBSD = $(DEF-x86_64) -DTARGETOS_FreeBSD
+DEF-x86_64-NetBSD  = $(DEF-x86_64) -DTARGETOS_NetBSD
+DEF-x86_64-OpenBSD = $(DEF-x86_64) -DTARGETOS_OpenBSD
+
+DEF-$(NATIVE_TARGET) = $(NATIVE_DEFINES)
 
 ifeq ($(INCLUDED),no)
 # --------------------------------------------------------------------------
@@ -105,6 +131,11 @@ TCCLIBS = $(LIBTCCDEF) $(LIBTCC) $(LIBTCC1)
 TCCDOCS = tcc.1 tcc-doc.html tcc-doc.info
 
 all: $(PROGS) $(TCCLIBS) $(TCCDOCS)
+
+# cross compiler targets to build
+TCC_X = i386 x86_64 i386-win32 x86_64-win32 x86_64-osx arm arm64 arm-wince c67
+TCC_X += riscv64
+# TCC_X += arm-fpa arm-fpa-ld arm-vfp arm-eabi
 
 # cross libtcc1.a targets to build
 LIBTCC1_X = i386 x86_64 i386-win32 x86_64-win32 x86_64-osx arm arm64 arm-wince
@@ -131,23 +162,6 @@ endif
 
 T = $(or $(CROSS_TARGET),$(NATIVE_TARGET),unknown)
 X = $(if $(CROSS_TARGET),$(CROSS_TARGET)-)
-
-DEF-i386        = -DTCC_TARGET_I386
-DEF-x86_64      = -DTCC_TARGET_X86_64
-DEF-i386-win32  = -DTCC_TARGET_PE -DTCC_TARGET_I386
-DEF-x86_64-win32= -DTCC_TARGET_PE -DTCC_TARGET_X86_64
-DEF-x86_64-osx  = -DTCC_TARGET_MACHO -DTCC_TARGET_X86_64
-DEF-arm-wince   = -DTCC_TARGET_PE -DTCC_TARGET_ARM -DTCC_ARM_EABI -DTCC_ARM_VFP -DTCC_ARM_HARDFLOAT
-DEF-arm64       = -DTCC_TARGET_ARM64 -Wno-format
-DEF-c67         = -DTCC_TARGET_C67 -w # disable warnigs
-DEF-arm-fpa     = -DTCC_TARGET_ARM
-DEF-arm-fpa-ld  = -DTCC_TARGET_ARM -DLDOUBLE_SIZE=12
-DEF-arm-vfp     = -DTCC_TARGET_ARM -DTCC_ARM_VFP
-DEF-arm-eabi    = -DTCC_TARGET_ARM -DTCC_ARM_VFP -DTCC_ARM_EABI
-DEF-arm-eabihf  = -DTCC_TARGET_ARM -DTCC_ARM_VFP -DTCC_ARM_EABI -DTCC_ARM_HARDFLOAT
-DEF-arm         = $(DEF-arm-eabihf)
-DEF-riscv64     = -DTCC_TARGET_RISCV64
-DEF-$(NATIVE_TARGET) = $(NATIVE_DEFINES)
 
 DEFINES += $(DEF-$T) $(DEF-all)
 DEFINES += $(if $(ROOT-$T),-DCONFIG_SYSROOT="\"$(ROOT-$T)\"")
@@ -176,7 +190,7 @@ i386-win32_FILES = $(i386_FILES) tccpe.c
 x86_64_FILES = $(CORE_FILES) x86_64-gen.c x86_64-link.c i386-asm.c x86_64-asm.h
 x86_64-win32_FILES = $(x86_64_FILES) tccpe.c
 x86_64-osx_FILES = $(x86_64_FILES) tccmacho.c
-arm_FILES = $(CORE_FILES) arm-gen.c arm-link.c arm-asm.c
+arm_FILES = $(CORE_FILES) arm-gen.c arm-link.c arm-asm.c arm-tok.h
 arm-wince_FILES = $(arm_FILES) tccpe.c
 arm-eabihf_FILES = $(arm_FILES)
 arm-fpa_FILES     = $(arm_FILES)
@@ -184,9 +198,12 @@ arm-fpa-ld_FILES  = $(arm_FILES)
 arm-vfp_FILES     = $(arm_FILES)
 arm-eabi_FILES    = $(arm_FILES)
 arm-eabihf_FILES  = $(arm_FILES)
-arm64_FILES = $(CORE_FILES) arm64-gen.c arm64-link.c arm-asm.c
+arm64_FILES = $(CORE_FILES) arm64-gen.c arm64-link.c arm64-asm.c
+arm64-osx_FILES = $(arm64_FILES) tccmacho.c
 c67_FILES = $(CORE_FILES) c67-gen.c c67-link.c tcccoff.c
 riscv64_FILES = $(CORE_FILES) riscv64-gen.c riscv64-link.c riscv64-asm.c
+
+TCCDEFS_H$(subst yes,,$(CONFIG_predefs)) = tccdefs_.h
 
 # libtcc sources
 LIBTCC_SRC = $(filter-out tcc.c tcctools.c,$(filter %.c,$($T_FILES)))
@@ -196,22 +213,27 @@ LIBTCC_OBJ = $(X)libtcc.o
 LIBTCC_INC = $($T_FILES)
 TCC_FILES = $(X)tcc.o
 tcc.o : DEFINES += -DONE_SOURCE=0
+$(X)tcc.o $(X)libtcc.o  : $(TCCDEFS_H)
 else
 LIBTCC_OBJ = $(patsubst %.c,$(X)%.o,$(LIBTCC_SRC))
 LIBTCC_INC = $(filter %.h %-gen.c %-link.c,$($T_FILES))
 TCC_FILES = $(X)tcc.o $(LIBTCC_OBJ)
 $(TCC_FILES) : DEFINES += -DONE_SOURCE=0
+$(X)tccpp.o : $(TCCDEFS_H)
 endif
 
-ifeq ($(CONFIG_strip),no)
+ifeq ($(CONFIG_debug),yes)
 CFLAGS += -g
 LDFLAGS += -g
 else
-CONFIG_strip = yes
 ifndef CONFIG_OSX
 LDFLAGS += -s
 endif
 endif
+
+# convert "include/tccdefs.h" to "tccdefs_.h"
+%_.h : include/%.h conftest.c
+	$S$(CC) -DC2STR $(filter %.c,$^) -o c2str.exe && ./c2str.exe $< $@
 
 # target specific object rule
 $(X)%.o : %.c $(LIBTCC_INC)
@@ -225,7 +247,13 @@ tcc$(EXESUF): tcc.o $(LIBTCC)
 	$S$(CC) -o $@ $^ $(LIBS) $(LDFLAGS) $(LINK_LIBTCC)
 
 # Cross Tiny C Compilers
-%-tcc$(EXESUF): FORCE
+# (the TCCDEFS_H dependency is only necessary for parallel makes,
+# ala 'make -j x86_64-tcc i386-tcc tcc', which would create multiple
+# c2str.exe and tccdefs_.h files in parallel, leading to access errors.
+# This forces it to be made only once.  Make normally tracks multiple paths
+# to the same goals and only remakes it once, but that doesn't work over
+# sub-makes like in this target)
+%-tcc$(EXESUF): $(TCCDEFS_H) FORCE
 	@$(MAKE) --no-print-directory $@ CROSS_TARGET=$* ONE_SOURCE=$(or $(ONE_SOURCE),yes)
 
 $(CROSS_TARGET)-tcc$(EXESUF): $(TCC_FILES)
@@ -399,8 +427,8 @@ testspp.%:
 	@$(MAKE) -C tests/pp $@
 
 clean:
-	@rm -f tcc$(EXESUF) tcc_p$(EXESUF) *-tcc$(EXESUF) tcc.pod
-	@rm -f *.o *.a *.so* *.out *.log lib*.def *.exe *.dll a.out tags TAGS *.dylib
+	@rm -f tcc$(EXESUF) tcc_p$(EXESUF) *-tcc$(EXESUF) tcc.pod tags ETAGS
+	@rm -f *.o *.a *.so* *.out *.log lib*.def *.exe *.dll a.out *.dylib *_.h
 	@$(MAKE) -s -C lib $@
 	@$(MAKE) -s -C tests $@
 

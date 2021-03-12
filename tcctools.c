@@ -68,7 +68,7 @@ static int ar_usage(int ret) {
 
 ST_FUNC int tcc_tool_ar(TCCState *s1, int argc, char **argv)
 {
-    static ArHdr arhdr = {
+    static const ArHdr arhdr_init = {
         "/               ",
         "            ",
         "0     ",
@@ -78,15 +78,8 @@ ST_FUNC int tcc_tool_ar(TCCState *s1, int argc, char **argv)
         ARFMAG
         };
 
-    static ArHdr arhdro = {
-        "                ",
-        "            ",
-        "0     ",
-        "0     ",
-        "0       ",
-        "          ",
-        ARFMAG
-        };
+    ArHdr arhdr = arhdr_init;
+    ArHdr arhdro = arhdr_init;
 
     FILE *fi, *fh = NULL, *fo = NULL;
     ElfW(Ehdr) *ehdr;
@@ -506,19 +499,32 @@ ST_FUNC void tcc_tool_cross(TCCState *s1, char **argv, int target)
 /* enable commandline wildcard expansion (tcc -o x.exe *.c) */
 
 #ifdef _WIN32
-int _CRT_glob = 1;
+const int _CRT_glob = 1;
 #ifndef _CRT_glob
-int _dowildcard = 1;
+const int _dowildcard = 1;
 #endif
 #endif
 
 /* -------------------------------------------------------------- */
 /* generate xxx.d file */
 
+static char *escape_target_dep(const char *s) {
+    char *res = tcc_malloc(strlen(s) * 2 + 1);
+    int j;
+    for (j = 0; *s; s++, j++) {
+        if (is_space(*s)) {
+            res[j++] = '\\';
+        }
+        res[j] = *s;
+    }
+    res[j] = '\0';
+    return res;
+}
+
 ST_FUNC void gen_makedeps(TCCState *s1, const char *target, const char *filename)
 {
     FILE *depout;
-    char buf[1024];
+    char buf[1024], *escaped_target;
     int i, k;
 
     if (!filename) {
@@ -540,7 +546,9 @@ ST_FUNC void gen_makedeps(TCCState *s1, const char *target, const char *filename
         for (k = 0; k < i; ++k)
             if (0 == strcmp(s1->target_deps[i], s1->target_deps[k]))
                 goto next;
-        fprintf(depout, " \\\n  %s", s1->target_deps[i]);
+        escaped_target = escape_target_dep(s1->target_deps[i]);
+        fprintf(depout, " \\\n  %s", escaped_target);
+        tcc_free(escaped_target);
     next:;
     }
     fprintf(depout, "\n");

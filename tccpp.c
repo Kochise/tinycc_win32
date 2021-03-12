@@ -89,6 +89,7 @@ static const unsigned char tok_two_chars[] =
     '-','>', TOK_ARROW,
     '.','.', TOK_TWODOTS,
     '#','#', TOK_TWOSHARPS,
+    '#','#', TOK_PPJOIN,
     0
 };
 
@@ -104,6 +105,11 @@ ST_FUNC void skip(int c)
 ST_FUNC void expect(const char *msg)
 {
     tcc_error("%s expected", msg);
+}
+
+ST_FUNC void expect_arg(const char *msg, size_t arg)
+{
+    tcc_error("%s expected as arg #%zu", msg, arg);
 }
 
 /* ------------------------------------------------------------------------- */
@@ -344,6 +350,24 @@ ST_INLN void cstr_ccat(CString *cstr, int ch)
     cstr->size = size;
 }
 
+ST_INLN char *unicode_to_utf8 (char *b, uint32_t Uc)
+{
+    if (Uc<0x80) *b++=Uc;
+    else if (Uc<0x800) *b++=192+Uc/64, *b++=128+Uc%64;
+    else if (Uc-0xd800u<0x800) return b;
+    else if (Uc<0x10000) *b++=224+Uc/4096, *b++=128+Uc/64%64, *b++=128+Uc%64;
+    else if (Uc<0x110000) *b++=240+Uc/262144, *b++=128+Uc/4096%64, *b++=128+Uc/64%64, *b++=128+Uc%64;
+    return b;
+}
+
+/* add a unicode character expanded into utf8 */
+ST_INLN void cstr_u8cat(CString *cstr, int ch)
+{
+    char buf[4], *e;
+    e = unicode_to_utf8(buf, (uint32_t)ch);
+    cstr_cat(cstr, buf, e - buf);
+}
+
 ST_FUNC void cstr_cat(CString *cstr, const char *str, int len)
 {
     int size;
@@ -388,17 +412,19 @@ ST_FUNC void cstr_reset(CString *cstr)
 ST_FUNC int cstr_printf(CString *cstr, const char *fmt, ...)
 {
     va_list v;
-    int len, size;
-
-    va_start(v, fmt);
-    len = vsnprintf(NULL, 0, fmt, v);
-    va_end(v);
-    size = cstr->size + len + 1;
-    if (size > cstr->size_allocated)
-        cstr_realloc(cstr, size);
-    va_start(v, fmt);
-    vsnprintf((char*)cstr->data + cstr->size, size, fmt, v);
-    va_end(v);
+    int len, size = 80;
+    for (;;) {
+        size += cstr->size;
+        if (size > cstr->size_allocated)
+            cstr_realloc(cstr, size);
+        size = cstr->size_allocated - cstr->size;
+        va_start(v, fmt);
+        len = vsnprintf((char*)cstr->data + cstr->size, size, fmt, v);
+        va_end(v);
+        if (len > 0 && len < size)
+            break;
+        size *= 2;
+    }
     cstr->size += len;
     return len;
 }
@@ -483,6 +509,12 @@ ST_FUNC TokenSym *tok_alloc(const char *str, int len)
     }
     return tok_alloc_new(pts, str, len);
 }
+
+ST_FUNC int tok_alloc_const(const char *str)
+{
+    return tok_alloc(str, strlen(str))->tok;
+}
+
 
 /* XXX: buffer overflow */
 /* XXX: float tokens */
@@ -583,6 +615,7 @@ ST_FUNC const char *get_tok_str(int v, CValue *cv)
         }
         addv:
             *p++ = v;
+    case 0: /* nameless anonymous symbol */
             *p = '\0';
         } else if (v < tok_ident) {
             return table_ident[v - TOK_IDENT]->str;
@@ -1006,8 +1039,13 @@ redo_start:
                     goto redo_start;
                 else if (parse_flags & PARSE_FLAG_ASM_FILE)
                     p = parse_line_comment(p - 1);
-            } else if (parse_flags & PARSE_FLAG_ASM_FILE)
+            }
+#if !defined(TCC_TARGET_ARM)
+            else if (parse_flags & PARSE_FLAG_ASM_FILE)
                 p = parse_line_comment(p - 1);
+#else
+            /* ARM assembly uses '#' for constants */
+#endif
             break;
 _default:
         default:
@@ -1837,8 +1875,6 @@ ST_FUNC void preprocess(int is_bof)
 
         if (s1->include_stack_ptr >= s1->include_stack + INCLUDE_STACK_SIZE)
             tcc_error("#include recursion too deep");
-        /* push current file on stack */
-        *s1->include_stack_ptr++ = file;
         i = tok == TOK_INCLUDE_NEXT ? file->include_next_index + 1 : 0;
         n = 2 + s1->nb_include_paths + s1->nb_sysinclude_paths;
         for (; i < n; ++i) {
@@ -1881,7 +1917,8 @@ ST_FUNC void preprocess(int is_bof)
 
             if (tcc_open(s1, buf1) < 0)
                 continue;
-
+            /* push previous file on stack */
+            *s1->include_stack_ptr++ = file->prev;
             file->include_next_index = i;
 #ifdef INC_DEBUG
             printf("%s: including %s\n", file->prev->filename, file->filename);
@@ -1904,7 +1941,6 @@ ST_FUNC void preprocess(int is_bof)
         }
         tcc_error("include file '%s' not found", buf);
 include_done:
-        --s1->include_stack_ptr;
         break;
     case TOK_IFNDEF:
         c = 1;
@@ -2058,7 +2094,7 @@ include_done:
 /* evaluate escape codes in a string. */
 static void parse_escape_string(CString *outstr, const uint8_t *buf, int is_long)
 {
-    int c, n;
+    int c, n, i;
     const uint8_t *p;
 
     p = buf;
@@ -2088,12 +2124,13 @@ static void parse_escape_string(CString *outstr, const uint8_t *buf, int is_long
                 }
                 c = n;
                 goto add_char_nonext;
-            case 'x':
-            case 'u':
-            case 'U':
+            case 'x': i = 0; goto parse_hex_or_ucn;
+            case 'u': i = 4; goto parse_hex_or_ucn;
+            case 'U': i = 8; goto parse_hex_or_ucn;
+    parse_hex_or_ucn:
                 p++;
                 n = 0;
-                for(;;) {
+                do {
                     c = *p;
                     if (c >= 'a' && c <= 'f')
                         c = c - 'a' + 10;
@@ -2101,13 +2138,17 @@ static void parse_escape_string(CString *outstr, const uint8_t *buf, int is_long
                         c = c - 'A' + 10;
                     else if (isnum(c))
                         c = c - '0';
-                    else
-                        break;
+                    else if (i > 0)
+                        expect("more hex digits in universal-character-name");
+                    else {
+                        c = n;
+                        goto add_char_nonext;
+                    }
                     n = n * 16 + c;
                     p++;
-                }
-                c = n;
-                goto add_char_nonext;
+                } while (--i);
+                cstr_u8cat(outstr, n);
+                continue;
             case 'a':
                 c = '\a';
                 break;
@@ -2702,10 +2743,13 @@ maybe_newline:
                 p++;
                 tok = TOK_TWOSHARPS;
             } else {
+#if !defined(TCC_TARGET_ARM)
                 if (parse_flags & PARSE_FLAG_ASM_FILE) {
                     p = parse_line_comment(p - 1);
                     goto redo_no_start;
-                } else {
+                } else
+#endif
+                {
                     tok = '#';
                 }
             }
@@ -3622,117 +3666,88 @@ ST_INLN void unget_tok(int last_tok)
     tok = last_tok;
 }
 
-static void tcc_predefs(CString *cstr)
-{
-    cstr_cat(cstr,
+/* ------------------------------------------------------------------------- */
+/* init preprocessor */
 
-    //"#include <tcc_predefs.h>\n"
-
-#if defined TCC_TARGET_X86_64
-#ifndef TCC_TARGET_PE
-    /* GCC compatible definition of va_list. */
-    /* This should be in sync with the declaration in our lib/libtcc1.c */
-    "typedef struct{\n"
-    "unsigned gp_offset,fp_offset;\n"
-    "union{\n"
-    "unsigned overflow_offset;\n"
-    "char*overflow_arg_area;\n"
-    "};\n"
-    "char*reg_save_area;\n"
-    "}__builtin_va_list[1];\n"
-    "void*__va_arg(__builtin_va_list ap,int arg_type,int size,int align);\n"
-    "#define __builtin_va_start(ap,last) (*(ap)=*(__builtin_va_list)((char*)__builtin_frame_address(0)-24))\n"
-    "#define __builtin_va_arg(ap,t) (*(t*)(__va_arg(ap,__builtin_va_arg_types(t),sizeof(t),__alignof__(t))))\n"
-    "#define __builtin_va_copy(dest,src) (*(dest)=*(src))\n"
-#else /* TCC_TARGET_PE */
-    "typedef char*__builtin_va_list;\n"
-    "#define __builtin_va_arg(ap,t) ((sizeof(t)>8||(sizeof(t)&(sizeof(t)-1)))?**(t**)((ap+=8)-8):*(t*)((ap+=8)-8))\n"
-#endif
-#elif defined TCC_TARGET_ARM
-    "typedef char*__builtin_va_list;\n"
-    "#define _tcc_alignof(type) ((int)&((struct{char c;type x;}*)0)->x)\n"
-    "#define _tcc_align(addr,type) (((unsigned)addr+_tcc_alignof(type)-1)&~(_tcc_alignof(type)-1))\n"
-    "#define __builtin_va_start(ap,last) (ap=((char*)&(last))+((sizeof(last)+3)&~3))\n"
-    "#define __builtin_va_arg(ap,type) (ap=(void*)((_tcc_align(ap,type)+sizeof(type)+3)&~3),*(type*)(ap-((sizeof(type)+3)&~3)))\n"
-#elif defined TCC_TARGET_ARM64
-    "typedef struct{\n"
-    "void*__stack,*__gr_top,*__vr_top;\n"
-    "int __gr_offs,__vr_offs;\n"
-    "}__builtin_va_list;\n"
-#elif defined TCC_TARGET_RISCV64
-    "typedef char*__builtin_va_list;\n"
-    "#define __va_reg_size (__riscv_xlen>>3)\n"
-    "#define _tcc_align(addr,type) (((unsigned long)addr+__alignof__(type)-1)&-(__alignof__(type)))\n"
-    "#define __builtin_va_arg(ap,type) (*(sizeof(type)>(2*__va_reg_size)?*(type**)((ap+=__va_reg_size)-__va_reg_size):(ap=(va_list)(_tcc_align(ap,type)+(sizeof(type)+__va_reg_size-1)&-__va_reg_size),(type*)(ap-((sizeof(type)+__va_reg_size-1)&-__va_reg_size)))))\n"
-#else /* TCC_TARGET_I386 */
-    "typedef char*__builtin_va_list;\n"
-    "#define __builtin_va_start(ap,last) (ap=((char*)&(last))+((sizeof(last)+3)&~3))\n"
-    "#define __builtin_va_arg(ap,t) (*(t*)((ap+=(sizeof(t)+3)&~3)-((sizeof(t)+3)&~3)))\n"
-#endif
-    "#define __builtin_va_end(ap) (void)(ap)\n"
-    "#ifndef __builtin_va_copy\n"
-    "#define __builtin_va_copy(dest,src) (dest)=(src)\n"
-    "#endif\n"
-    "#ifdef __leading_underscore\n"
-    "#define __RENAME(X) __asm__(\"_\"X)\n"
-    "#else\n"
-    "#define __RENAME(X) __asm__(X)\n"
-    "#endif\n"
-    /* TCC BBUILTIN AND BOUNDS ALIASES */
-    "#ifdef __BOUNDS_CHECKING_ON\n"
-    "#define __BUILTINBC(ret,name,params) ret __builtin_##name params __RENAME(\"__bound_\"#name);\n"
-    "#define __BOUND(ret,name,params) ret name params __RENAME(\"__bound_\"#name);\n"
-    "#else\n"
-    "#define __BUILTINBC(ret,name,params) ret __builtin_##name params __RENAME(#name);\n"
-    "#define __BOUND(ret,name,params)\n"
-    "#endif\n"
-    "#define __BOTH(ret,name,params) __BUILTINBC(ret,name,params)__BOUND(ret,name,params)\n"
-    "#define __BUILTIN(ret,name,params) ret __builtin_##name params __RENAME(#name);\n"
-    "__BOTH(void*,memcpy,(void*,const void*,__SIZE_TYPE__))\n"
-    "__BOTH(void*,memmove,(void*,const void*,__SIZE_TYPE__))\n"
-    "__BOTH(void*,memset,(void*,int,__SIZE_TYPE__))\n"
-    "__BOTH(int,memcmp,(const void*,const void*,__SIZE_TYPE__))\n"
-    "__BOTH(__SIZE_TYPE__,strlen,(const char*))\n"
-    "__BOTH(char*,strcpy,(char*,const char*))\n"
-    "__BOTH(char*,strncpy,(char*,const char*,__SIZE_TYPE__))\n"
-    "__BOTH(int,strcmp,(const char*,const char*))\n"
-    "__BOTH(int,strncmp,(const char*,const char*,__SIZE_TYPE__))\n"
-    "__BOTH(char*,strcat,(char*,const char*))\n"
-    "__BOTH(char*,strchr,(const char*,int))\n"
-    "__BOTH(char*,strdup,(const char*))\n"
+static const char * const target_os_defs =
 #ifdef TCC_TARGET_PE
-    "#define __MAYBE_REDIR __BOTH\n"
-#else  // HAVE MALLOC_REDIR
-    "#define __MAYBE_REDIR __BUILTIN\n"
+    "_WIN32\0"
+# if PTR_SIZE == 8
+    "_WIN64\0"
+# endif
+#else
+# if defined TCC_TARGET_MACHO
+    "__APPLE__\0"
+# elif TARGETOS_FreeBSD
+    "__FreeBSD__ 12\0"
+# elif TARGETOS_FreeBSD_kernel
+    "__FreeBSD_kernel__\0"
+# elif TARGETOS_NetBSD
+    "__NetBSD__\0"
+# elif TARGETOS_OpenBSD
+    "__OpenBSD__\0"
+# else
+    "__linux__\0"
+    "__linux\0"
+# endif
+    "__unix__\0"
+    "__unix\0"
 #endif
-    "__MAYBE_REDIR(void*,malloc,(__SIZE_TYPE__))\n"
-    "__MAYBE_REDIR(void*,realloc,(void*,__SIZE_TYPE__))\n"
-    "__MAYBE_REDIR(void*,calloc,(__SIZE_TYPE__,__SIZE_TYPE__))\n"
-    "__MAYBE_REDIR(void*,memalign,(__SIZE_TYPE__,__SIZE_TYPE__))\n"
-    "__MAYBE_REDIR(void,free,(void*))\n"
-#if defined TCC_TARGET_I386 || defined TCC_TARGET_X86_64
-    "__BOTH(void*,alloca,(__SIZE_TYPE__))\n"
+    ;
+
+static void putdef(CString *cs, const char *p)
+{
+    cstr_printf(cs, "#define %s%s\n", p, &" 1"[!!strchr(p, ' ')*2]);
+}
+
+static void tcc_predefs(TCCState *s1, CString *cs, int is_asm)
+{
+    int a, b, c;
+    const char *defs[] = { target_machine_defs, target_os_defs, NULL };
+    const char *p;
+
+    sscanf(TCC_VERSION, "%d.%d.%d", &a, &b, &c);
+    cstr_printf(cs, "#define __TINYC__ %d\n", a*10000 + b*100 + c);
+    for (a = 0; defs[a]; ++a)
+        for (p = defs[a]; *p; p = strchr(p, 0) + 1)
+            putdef(cs, p);
+#ifdef TCC_TARGET_ARM
+    if (s1->float_abi == ARM_HARD_FLOAT)
+      putdef(cs, "__ARM_PCS_VFP");
 #endif
-#if defined(TCC_TARGET_ARM) && defined(TCC_ARM_EABI)
-    "__BOUND(void*,__aeabi_memcpy,(void*,const void*,__SIZE_TYPE__))\n"
-    "__BOUND(void*,__aeabi_memmove,(void*,const void*,__SIZE_TYPE__))\n"
-    "__BOUND(void*,__aeabi_memmove4,(void*,const void*,__SIZE_TYPE__))\n"
-    "__BOUND(void*,__aeabi_memmove8,(void*,const void*,__SIZE_TYPE__))\n"
-    "__BOUND(void*,__aeabi_memset,(void*,int,__SIZE_TYPE__))\n"
+    if (is_asm)
+      putdef(cs, "__ASSEMBLER__");
+    if (s1->output_type == TCC_OUTPUT_PREPROCESS)
+      putdef(cs, "__TCC_PP__");
+    if (s1->output_type == TCC_OUTPUT_MEMORY)
+      putdef(cs, "__TCC_RUN__");
+    if (s1->char_is_unsigned)
+      putdef(cs, "__CHAR_UNSIGNED__");
+    if (s1->optimize > 0)
+      putdef(cs, "__OPTIMIZE__");
+    if (s1->option_pthread)
+      putdef(cs, "_REENTRANT");
+    if (s1->leading_underscore)
+      putdef(cs, "__leading_underscore");
+#ifdef CONFIG_TCC_BCHECK
+    if (s1->do_bounds_check)
+      putdef(cs, "__BOUNDS_CHECKING_ON");
 #endif
-    "__BUILTIN(void,abort,(void))\n"
-    "__BOUND(int,longjmp,())\n"
-#ifndef TCC_TARGET_PE
-    "__BOUND(void*,mmap,())\n"
-    "__BOUND(void*,munmap,())\n"
+    cstr_printf(cs, "#define __SIZEOF_POINTER__ %d\n", PTR_SIZE);
+    cstr_printf(cs, "#define __SIZEOF_LONG__ %d\n", LONG_SIZE);
+    if (!is_asm) {
+      putdef(cs, "__STDC__");
+      cstr_printf(cs, "#define __STDC_VERSION__ %dL\n", s1->cversion);
+      cstr_cat(cs,
+        /* load more predefs and __builtins */
+#if CONFIG_TCC_PREDEFS
+        #include "tccdefs_.h" /* include as strings */
+#else
+        "#include <tccdefs.h>\n" /* load at runtime */
 #endif
-    "#undef __BUILTINBC\n"
-    "#undef __BUILTIN\n"
-    "#undef __BOUND\n"
-    "#undef __BOTH\n"
-    "#undef __MAYBE_REDIR\n"
-    "#undef __RENAME\n"
-    , -1);
+        , -1);
+    }
+    cstr_printf(cs, "#define __BASE_FILE__ \"%s\"\n", file->filename);
 }
 
 ST_FUNC void preprocess_start(TCCState *s1, int filetype)
@@ -3757,15 +3772,9 @@ ST_FUNC void preprocess_start(TCCState *s1, int filetype)
 
     if (!(filetype & AFF_TYPE_ASM)) {
         cstr_new(&cstr);
+        tcc_predefs(s1, &cstr, is_asm);
         if (s1->cmdline_defs.size)
           cstr_cat(&cstr, s1->cmdline_defs.data, s1->cmdline_defs.size);
-        cstr_printf(&cstr, "#define __BASE_FILE__ \"%s\"\n", file->filename);
-        if (is_asm)
-          cstr_printf(&cstr, "#define __ASSEMBLER__ 1\n");
-        if (s1->output_type == TCC_OUTPUT_MEMORY)
-          cstr_printf(&cstr, "#define __TCC_RUN__ 1\n");
-        if (!is_asm && s1->output_type != TCC_OUTPUT_PREPROCESS)
-          tcc_predefs(&cstr);
         if (s1->cmdline_incl.size)
           cstr_cat(&cstr, s1->cmdline_incl.data, s1->cmdline_incl.size);
         //printf("%s\n", (char*)cstr.data);
