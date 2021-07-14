@@ -1001,9 +1001,12 @@ ST_FUNC void relocate_sections(TCCState *s1)
         if (sr->sh_type != SHT_RELX)
             continue;
         s = s1->sections[sr->sh_info];
+#ifndef TCC_TARGET_MACHO
         if (s != s1->got
             || s1->static_link
-            || s1->output_type == TCC_OUTPUT_MEMORY) {
+            || s1->output_type == TCC_OUTPUT_MEMORY)
+#endif
+        {
             relocate_section(s1, s, sr);
         }
 #ifndef ELF_OBJ_ONLY
@@ -1466,7 +1469,7 @@ static void tcc_tcov_add_file(TCCState *s1, const char *filename)
         cstr_printf (&cstr, "%s/%s.tcov", wd, filename);
     }
     ptr = section_ptr_add(tcov_section, cstr.size + 1);
-    strncpy((char *)ptr, cstr.data, cstr.size);
+    strcpy((char *)ptr, cstr.data);
     unlink((char *)ptr);
 #ifdef _WIN32
     normalize_slashes((char *)ptr);
@@ -2336,7 +2339,8 @@ static void tcc_output_elf(TCCState *s1, FILE *f, int phnum, ElfW(Phdr) *phdr,
     ehdr.e_shstrndx = shnum - 1;
 
     fwrite(&ehdr, 1, sizeof(ElfW(Ehdr)), f);
-    fwrite(phdr, 1, phnum * sizeof(ElfW(Phdr)), f);
+    if (phdr)
+        fwrite(phdr, 1, phnum * sizeof(ElfW(Phdr)), f);
     offset = sizeof(ElfW(Ehdr)) + phnum * sizeof(ElfW(Phdr));
 
     sort_syms(s1, symtab_section);

@@ -107,11 +107,6 @@ ST_FUNC void expect(const char *msg)
     tcc_error("%s expected", msg);
 }
 
-ST_FUNC void expect_arg(const char *msg, size_t arg)
-{
-    tcc_error("%s expected as arg #%zu", msg, arg);
-}
-
 /* ------------------------------------------------------------------------- */
 /* Custom allocator for tiny objects */
 
@@ -1929,7 +1924,7 @@ ST_FUNC void preprocess(int is_bof)
                 while (i == 1 && (bf = bf->prev))
                     i = bf->include_next_index;
                 /* skip system include files */
-                if (n - i > s1->nb_sysinclude_paths)
+                if (s1->include_sys_deps || n - i > s1->nb_sysinclude_paths)
                     dynarray_add(&s1->target_deps, &s1->nb_target_deps,
                         tcc_strdup(buf1));
             }
@@ -3429,7 +3424,8 @@ static int macro_subst_tok(
             for(;;) {
                 do {
                     next_argstream(nested_list, NULL);
-                } while (is_space(tok) || TOK_LINEFEED == tok);
+                } while (tok == TOK_PLCHLDR || is_space(tok) ||
+			 TOK_LINEFEED == tok);
     empty_arg:
                 /* handle '()' case */
                 if (!args && !sa && tok == ')')

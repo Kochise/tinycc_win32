@@ -222,6 +222,12 @@ $(TCC_FILES) : DEFINES += -DONE_SOURCE=0
 $(X)tccpp.o : $(TCCDEFS_H)
 endif
 
+TCC_GIT_HASH=$(shell git rev-parse > /dev/null 2>&1 && git rev-parse --short HEAD || echo no)
+ifneq ($(TCC_GIT_HASH),no)
+MODIFIED = $(shell git diff | grep -q +++ && echo "modified ")
+$(X)tcc.o : DEFINES +=  -DTCC_GIT_HASH="\"$(MODIFIED)$(TCC_GIT_HASH)\""
+endif
+
 ifeq ($(CONFIG_debug),yes)
 CFLAGS += -g
 LDFLAGS += -g

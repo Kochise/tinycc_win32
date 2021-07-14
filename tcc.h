@@ -42,6 +42,7 @@
 #ifndef _WIN32
 # include <unistd.h>
 # include <sys/time.h>
+# include <sys/stat.h>
 # ifndef CONFIG_TCC_STATIC
 #  include <dlfcn.h>
 # endif
@@ -278,6 +279,15 @@ extern long double strtold (const char *__nptr, char **__endptr);
         ALSO_TRIPLET(CONFIG_SYSROOT "/usr/" CONFIG_LDDIR) \
     ":" ALSO_TRIPLET(CONFIG_SYSROOT "/" CONFIG_LDDIR) \
     ":" ALSO_TRIPLET(CONFIG_SYSROOT "/usr/local/" CONFIG_LDDIR)
+#  ifdef TCC_TARGET_MACHO
+#   define CONFIG_OSX_SDK1 \
+        "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk"
+#   define CONFIG_OSX_SDK2 \
+        "/Applications/Xcode.app/Developer/SDKs/MacOSX.sdk"
+#   define CONFIG_OSX_SDK_FALLBACK \
+        ALSO_TRIPLET(CONFIG_OSX_SDK1 "/usr/" CONFIG_LDDIR) \
+    ":" ALSO_TRIPLET(CONFIG_OSX_SDK2 "/usr/" CONFIG_LDDIR)
+#  endif
 # endif
 #endif
 
@@ -975,7 +985,9 @@ struct TCCState {
     char *outfile; /* output filename */
     unsigned char option_r; /* option -r */
     unsigned char do_bench; /* option -bench */
+    int just_deps; /* option -M  */
     int gen_deps; /* option -MD  */
+    int include_sys_deps; /* option -MD  */
     char *deps_outfile; /* option -MF */
     int argc;
     char **argv;
@@ -1049,7 +1061,6 @@ struct filespec {
 #define IS_UNION(t) ((t & (VT_STRUCT_MASK|VT_BTYPE)) == VT_UNION)
 
 #define VT_ATOMIC   VT_VOLATILE
-#define VT_MEMMODEL (VT_STATIC | VT_ENUM_VAL | VT_TYPEDEF)
 
 /* type mask (except storage) */
 #define VT_STORAGE (VT_EXTERN | VT_STATIC | VT_TYPEDEF | VT_INLINE)
@@ -1418,7 +1429,6 @@ ST_FUNC void tccpp_delete(TCCState *s);
 ST_FUNC int tcc_preprocess(TCCState *s1);
 ST_FUNC void skip(int c);
 ST_FUNC NORETURN void expect(const char *msg);
-ST_FUNC NORETURN void expect_arg(const char *msg, size_t arg);
 
 /* space excluding newline */
 static inline int is_space(int ch) {

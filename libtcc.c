@@ -855,6 +855,37 @@ LIBTCCAPI void tcc_delete(TCCState *s1)
 #endif
 }
 
+/* Looks for the active developer SDK set by xcode-select (or the default
+   one set during installation.) */
+#define SZPAIR(s) s "", sizeof(s)-1
+ST_FUNC int tcc_add_macos_sdkpath(TCCState* s)
+{
+#if defined(_WIN32)
+    (void)s;
+    return -1;
+#else
+    char *sdkroot = NULL, *pos = NULL;
+    void* xcs = dlopen("libxcselect.dylib", RTLD_GLOBAL | RTLD_LAZY);
+    CString path;
+    int (*f)(unsigned int, char**) = dlsym(xcs, "xcselect_host_sdk_path");
+
+    if (f) f(1, &sdkroot);
+    if (!sdkroot) return -1;
+    pos = strstr(sdkroot,"SDKs/MacOSX");
+    if (!pos) return -1;
+    cstr_new(&path);
+    cstr_cat(&path, sdkroot, pos-sdkroot);
+    cstr_cat(&path, SZPAIR("SDKs/MacOSX.sdk/usr/lib\0") );
+    tcc_add_library_path(s, (char*)path.data);
+    cstr_free(&path);
+#ifndef MEM_DEBUG /* FIXME: How to use free() instead of tcc_free() */
+    tcc_free(sdkroot);
+#endif
+    return 0;
+#endif
+}
+#undef SZPAIR
+
 LIBTCCAPI int tcc_set_output_type(TCCState *s, int output_type)
 {
     s->output_type = output_type;
@@ -881,7 +912,11 @@ LIBTCCAPI int tcc_set_output_type(TCCState *s, int output_type)
     }
 
     tcc_add_library_path(s, CONFIG_TCC_LIBPATHS);
-
+#ifdef TCC_TARGET_MACHO
+    if (tcc_add_macos_sdkpath(s) != 0) {
+        tcc_add_library_path(s, CONFIG_OSX_SDK_FALLBACK);
+    }
+#endif
 #ifdef TCC_TARGET_PE
 # ifdef _WIN32
     if (!s->nostdlib && output_type != TCC_OUTPUT_OBJ)
@@ -979,6 +1014,10 @@ static int tcc_glob_so(TCCState *s1, const char *pattern, char *buf, int size)
 }
 #endif
 
+#ifdef TCC_TARGET_MACHO
+ST_FUNC const char* macho_tbd_soname(const char* filename);
+#endif
+
 ST_FUNC int tcc_add_file_internal(TCCState *s1, const char *filename, int flags)
 {
     int fd, ret = -1;
@@ -1006,7 +1045,9 @@ ST_FUNC int tcc_add_file_internal(TCCState *s1, const char *filename, int flags)
         lseek(fd, 0, SEEK_SET);
 
 #ifdef TCC_TARGET_MACHO
-        if (0 == obj_type && 0 == strcmp(tcc_fileextension(filename), ".dylib"))
+        if (0 == obj_type
+            && (0 == strcmp(tcc_fileextension(filename), ".dylib")
+            ||  0 == strcmp(tcc_fileextension(filename), ".tbd")))
             obj_type = AFF_BINTYPE_DYN;
 #endif
 
@@ -1027,11 +1068,21 @@ ST_FUNC int tcc_add_file_internal(TCCState *s1, const char *filename, int flags)
         case AFF_BINTYPE_DYN:
             if (s1->output_type == TCC_OUTPUT_MEMORY) {
 #ifdef TCC_IS_NATIVE
-                void *dl = dlopen(filename, RTLD_GLOBAL | RTLD_LAZY);
+                void* dl;
+                const char* soname = filename;
+# ifdef TCC_TARGET_MACHO
+                if (!strcmp(tcc_fileextension(filename), ".tbd"))
+                    soname = macho_tbd_soname(filename);
+# endif
+                dl = dlopen(soname, RTLD_GLOBAL | RTLD_LAZY);
                 if (dl) {
-                    tcc_add_dllref(s1, filename)->handle = dl;
+                    tcc_add_dllref(s1, soname)->handle = dl;
                     ret = 0;
                 }
+# ifdef TCC_TARGET_MACHO
+	        if (strcmp(filename, soname))
+		    tcc_free((void *)soname);
+#endif
 #endif
                 break;
             }
@@ -1082,7 +1133,9 @@ LIBTCCAPI int tcc_add_file(TCCState *s, const char *filename)
                 filetype = AFF_TYPE_ASMPP;
             else if (!strcmp(ext, "s"))
                 filetype = AFF_TYPE_ASM;
-            else if (!PATHCMP(ext, "c") || !PATHCMP(ext, "i"))
+            else if (!PATHCMP(ext, "c")
+                     || !PATHCMP(ext, "h")
+                     || !PATHCMP(ext, "i"))
                 filetype = AFF_TYPE_C;
             else
                 filetype |= AFF_TYPE_BIN;
@@ -1140,8 +1193,8 @@ LIBTCCAPI int tcc_add_library(TCCState *s, const char *libraryname)
     static const char * const libs[] = { "%s/%s.def", "%s/lib%s.def", "%s/%s.dll", "%s/lib%s.dll", "%s/lib%s.a", NULL };
     const char * const *pp = s->static_link ? libs + 4 : libs;
 #elif defined TCC_TARGET_MACHO
-    static const char * const libs[] = { "%s/lib%s.dylib", "%s/lib%s.a", NULL };
-    const char * const *pp = s->static_link ? libs + 1 : libs;
+    static const char * const libs[] = { "%s/lib%s.dylib", "%s/lib%s.tbd", "%s/lib%s.a", NULL };
+    const char * const *pp = s->static_link ? libs + 2 : libs;
 #elif defined TARGETOS_OpenBSD
     static const char * const libs[] = { "%s/lib%s.so.*", "%s/lib%s.a", NULL };
     const char * const *pp = s->static_link ? libs + 1 : libs;
@@ -1500,8 +1553,11 @@ enum {
     TCC_OPTION_w,
     TCC_OPTION_pipe,
     TCC_OPTION_E,
+    TCC_OPTION_M,
     TCC_OPTION_MD,
     TCC_OPTION_MF,
+    TCC_OPTION_MM,
+    TCC_OPTION_MMD,
     TCC_OPTION_x,
     TCC_OPTION_ar,
     TCC_OPTION_impdef,
@@ -1566,8 +1622,11 @@ static const TCCOption tcc_options[] = {
     { "w", TCC_OPTION_w, 0 },
     { "pipe", TCC_OPTION_pipe, 0},
     { "E", TCC_OPTION_E, 0},
+    { "M", TCC_OPTION_M, 0},
     { "MD", TCC_OPTION_MD, 0},
     { "MF", TCC_OPTION_MF, TCC_OPTION_HAS_ARG },
+    { "MM", TCC_OPTION_MM, 0},
+    { "MMD", TCC_OPTION_MMD, 0},
     { "x", TCC_OPTION_x, TCC_OPTION_HAS_ARG },
     { "ar", TCC_OPTION_ar, 0},
 #ifdef TCC_TARGET_PE
@@ -1904,8 +1963,20 @@ reparse:
         case TCC_OPTION_P:
             s->Pflag = atoi(optarg) + 1;
             break;
+        case TCC_OPTION_M:
+            s->include_sys_deps = 1;
+            // fall through
+        case TCC_OPTION_MM:
+            s->just_deps = 1;
+            if(!s->deps_outfile)
+                s->deps_outfile = tcc_strdup("-");
+            // fall through
+        case TCC_OPTION_MMD:
+            s->gen_deps = 1;
+            break;
         case TCC_OPTION_MD:
             s->gen_deps = 1;
+            s->include_sys_deps = 1;
             break;
         case TCC_OPTION_MF:
             s->deps_outfile = tcc_strdup(optarg);
