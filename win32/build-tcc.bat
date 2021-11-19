@@ -7,8 +7,15 @@ setlocal
 if (%1)==(-clean) goto :cleanup
 set CC=gcc
 set /p VERSION= < ..\VERSION
+git.exe --version 2>nul
+if not %ERRORLEVEL%==0 goto :git_done
+for /f %%b in ('git.exe rev-parse --abbrev-ref HEAD') do set GITHASH=%%b
+for /f %%h in ('git.exe rev-parse --short HEAD') do set GITHASH=%GITHASH%:%%h
+git.exe diff --quiet
+if %ERRORLEVEL%==1 set GITHASH=%GITHASH%-mod
+set DEF_GITHASH=-DTCC_GITHASH="""%GITHASH%"""
+:git_done
 set INST=
-set BIN=
 set DOC=no
 set EXES_ONLY=no
 goto :a0
@@ -25,7 +32,6 @@ goto :a2
 if (%1)==(-t) set T=%2&& goto :a2
 if (%1)==(-v) set VERSION=%~2&& goto :a2
 if (%1)==(-i) set INST=%2&& goto :a2
-if (%1)==(-b) set BIN=%2&& goto :a2
 if (%1)==(-d) set DOC=yes&& goto :a3
 if (%1)==(-x) set EXES_ONLY=yes&& goto :a3
 if (%1)==() goto :p1
@@ -37,7 +43,6 @@ echo   -c "prog options"    use prog with options to compile tcc
 echo   -t 32/64             force 32/64 bit default target
 echo   -v "version"         set tcc version
 echo   -i tccdir            install tcc into tccdir
-echo   -b bindir            optionally install binaries into bindir elsewhere
 echo   -d                   create tcc-doc.html too (needs makeinfo)
 echo   -x                   just create the executables
 echo   -clean               delete all previously produced files and directories
@@ -77,7 +82,7 @@ set CMD=%CMD% %ARG%
 shift
 if not (%1)==() goto :c0
 echo on
-%CMD% -O1 -W2 -Zi -MT -GS- -nologo -link -opt:ref,icf
+%CMD% -O2 -W2 -Zi -MT -GS- -nologo %DEF_GITHASH% -link -opt:ref,icf
 @exit /B %ERRORLEVEL%
 
 @rem ------------------------------------------------------
@@ -89,7 +94,7 @@ set T=32
 if %PROCESSOR_ARCHITECTURE%_==AMD64_ set T=64
 if %PROCESSOR_ARCHITEW6432%_==AMD64_ set T=64
 :p2
-if "%CC:~-3%"=="gcc" set CC=%CC% -Os -s -static
+if "%CC:~-3%"=="gcc" set CC=%CC% -O2 -s -static %DEF_GITHASH%
 set D32=-DTCC_TARGET_PE -DTCC_TARGET_I386
 set D64=-DTCC_TARGET_PE -DTCC_TARGET_X86_64
 set P32=i386-win32
@@ -98,11 +103,13 @@ if %T%==64 goto :t64
 set D=%D32%
 set DX=%D64%
 set PX=%P64%
+set TX=64
 goto :p3
 :t64
 set D=%D64%
 set DX=%D32%
 set PX=%P32%
+set TX=32
 goto :p3
 
 :p3
@@ -118,12 +125,18 @@ echo>> ..\config.h #endif
 
 for %%f in (*tcc.exe *tcc.dll) do @del %%f
 
-:compiler
-%CC% -o libtcc.dll -shared ..\libtcc.c %D% -DLIBTCC_AS_DLL
+@if _%TCC_C%_==__ goto compiler_2parts
+@rem if TCC_C was defined then build only tcc.exe
+%CC% -o tcc.exe %TCC_C% %D%
+@goto :compiler_done
+
+:compiler_2parts
+@if _%LIBTCC_C%_==__ set LIBTCC_C=..\libtcc.c
+%CC% -o libtcc.dll -shared %LIBTCC_C% %D% -DLIBTCC_AS_DLL
 @if errorlevel 1 goto :the_end
 %CC% -o tcc.exe ..\tcc.c libtcc.dll %D% -DONE_SOURCE"=0"
 %CC% -o %PX%-tcc.exe ..\tcc.c %DX%
-
+:compiler_done
 @if (%EXES_ONLY%)==(yes) goto :files_done
 
 if not exist libtcc mkdir libtcc
@@ -134,34 +147,13 @@ copy>nul ..\libtcc.h libtcc
 copy>nul ..\tests\libtcc_test.c examples
 copy>nul tcc-win32.txt doc
 
-.\tcc -impdef libtcc.dll -o libtcc\libtcc.def
+if exist libtcc.dll .\tcc -impdef libtcc.dll -o libtcc\libtcc.def
 @if errorlevel 1 goto :the_end
 
 :libtcc1.a
-@set O1=libtcc1.o crt1.o crt1w.o wincrt1.o wincrt1w.o dllcrt1.o dllmain.o chkstk.o
-.\tcc -m32 -c ../lib/libtcc1.c
-.\tcc -m32 -c lib/crt1.c
-.\tcc -m32 -c lib/crt1w.c
-.\tcc -m32 -c lib/wincrt1.c
-.\tcc -m32 -c lib/wincrt1w.c
-.\tcc -m32 -c lib/dllcrt1.c
-.\tcc -m32 -c lib/dllmain.c
-.\tcc -m32 -c lib/chkstk.S
-.\tcc -m32 -c ../lib/alloca86.S
-.\tcc -m32 -c ../lib/alloca86-bt.S
-.\tcc -m32 -ar lib/libtcc1-32.a %O1% alloca86.o alloca86-bt.o
+call :makelib %T%
 @if errorlevel 1 goto :the_end
-.\tcc -m64 -c ../lib/libtcc1.c
-.\tcc -m64 -c lib/crt1.c
-.\tcc -m64 -c lib/crt1w.c
-.\tcc -m64 -c lib/wincrt1.c
-.\tcc -m64 -c lib/wincrt1w.c
-.\tcc -m64 -c lib/dllcrt1.c
-.\tcc -m64 -c lib/dllmain.c
-.\tcc -m64 -c lib/chkstk.S
-.\tcc -m64 -c ../lib/alloca86_64.S
-.\tcc -m64 -c ../lib/alloca86_64-bt.S
-.\tcc -m64 -ar lib/libtcc1-64.a %O1% alloca86_64.o alloca86_64-bt.o
+@if exist %PX%-tcc.exe call :makelib %TX%
 @if errorlevel 1 goto :the_end
 .\tcc -m%T% -c ../lib/bcheck.c -o lib/bcheck.o -g
 .\tcc -m%T% -c ../lib/bt-exe.c -o lib/bt-exe.o
@@ -180,12 +172,25 @@ for %%f in (*.o *.def) do @del %%f
 :copy-install
 @if (%INST%)==() goto :the_end
 if not exist %INST% mkdir %INST%
-@if (%BIN%)==() set BIN=%INST%
-if not exist %BIN% mkdir %BIN%
-for %%f in (*tcc.exe *tcc.dll) do @copy>nul %%f %BIN%\%%f
+for %%f in (*tcc.exe *tcc.dll) do @copy>nul %%f %INST%\%%f
 @if not exist %INST%\lib mkdir %INST%\lib
 for %%f in (lib\*.a lib\*.o lib\*.def) do @copy>nul %%f %INST%\%%f
 for %%f in (include examples libtcc doc) do @xcopy>nul /s/i/q/y %%f %INST%\%%f
 
 :the_end
+exit /B %ERRORLEVEL%
+
+:makelib
+.\tcc -m%1 -c ../lib/libtcc1.c
+.\tcc -m%1 -c lib/crt1.c
+.\tcc -m%1 -c lib/crt1w.c
+.\tcc -m%1 -c lib/wincrt1.c
+.\tcc -m%1 -c lib/wincrt1w.c
+.\tcc -m%1 -c lib/dllcrt1.c
+.\tcc -m%1 -c lib/dllmain.c
+.\tcc -m%1 -c lib/chkstk.S
+.\tcc -m%1 -c ../lib/alloca.S
+.\tcc -m%1 -c ../lib/alloca-bt.S
+.\tcc -m%1 -c ../lib/stdatomic.c
+.\tcc -m%1 -ar lib/libtcc1-%1.a libtcc1.o crt1.o crt1w.o wincrt1.o wincrt1w.o dllcrt1.o dllmain.o chkstk.o alloca.o alloca-bt.o stdatomic.o
 exit /B %ERRORLEVEL%

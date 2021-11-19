@@ -404,7 +404,7 @@ ST_FUNC void cstr_reset(CString *cstr)
     cstr->size = 0;
 }
 
-ST_FUNC int cstr_printf(CString *cstr, const char *fmt, ...)
+ST_FUNC int cstr_vprintf(CString *cstr, const char *fmt, va_list ap)
 {
     va_list v;
     int len, size = 80;
@@ -413,7 +413,7 @@ ST_FUNC int cstr_printf(CString *cstr, const char *fmt, ...)
         if (size > cstr->size_allocated)
             cstr_realloc(cstr, size);
         size = cstr->size_allocated - cstr->size;
-        va_start(v, fmt);
+        va_copy(v, ap);
         len = vsnprintf((char*)cstr->data + cstr->size, size, fmt, v);
         va_end(v);
         if (len > 0 && len < size)
@@ -421,6 +421,15 @@ ST_FUNC int cstr_printf(CString *cstr, const char *fmt, ...)
         size *= 2;
     }
     cstr->size += len;
+    return len;
+}
+
+ST_FUNC int cstr_printf(CString *cstr, const char *fmt, ...)
+{
+    va_list ap; int len;
+    va_start(ap, fmt);
+    len = cstr_vprintf(cstr, fmt, ap);
+    va_end(ap);
     return len;
 }
 
@@ -1435,7 +1444,7 @@ ST_FUNC void label_pop(Sym **ptop, Sym *slast, int keep)
     for(s = *ptop; s != slast; s = s1) {
         s1 = s->prev;
         if (s->r == LABEL_DECLARED) {
-            tcc_warning("label '%s' declared but not used", get_tok_str(s->v, NULL));
+            tcc_warning_c(warn_all)("label '%s' declared but not used", get_tok_str(s->v, NULL));
         } else if (s->r == LABEL_FORWARD) {
                 tcc_error("label '%s' used but not defined",
                       get_tok_str(s->v, NULL));
@@ -1716,6 +1725,7 @@ static void pragma_parse(TCCState *s1)
         /* This may be:
            #pragma pack(1) // set
            #pragma pack() // reset to default
+           #pragma pack(push) // push current
            #pragma pack(push,1) // push & set
            #pragma pack(pop) // restore previous */
         next();
@@ -1734,8 +1744,10 @@ static void pragma_parse(TCCState *s1)
                     next();
                     if (s1->pack_stack_ptr >= s1->pack_stack + PACK_STACK_SIZE - 1)
                         goto stk_error;
-                    s1->pack_stack_ptr++;
-                    skip(',');
+                    val = *s1->pack_stack_ptr++;
+                    if (tok != ',')
+                        goto pack_set;
+                    next();
                 }
                 if (tok != TOK_CINT)
                     goto pragma_err;
@@ -1744,6 +1756,7 @@ static void pragma_parse(TCCState *s1)
                     goto pragma_err;
                 next();
             }
+        pack_set:
             *s1->pack_stack_ptr = val;
         }
         if (tok != ')')
@@ -1770,9 +1783,8 @@ static void pragma_parse(TCCState *s1)
             tcc_free(p);
         }
 
-    } else if (s1->warn_unsupported) {
-        tcc_warning("#pragma %s is ignored", get_tok_str(tok, &tokc));
-    }
+    } else
+        tcc_warning_c(warn_unsupported)("#pragma %s ignored", get_tok_str(tok, &tokc));
     return;
 
 pragma_err:
@@ -2294,7 +2306,7 @@ static void parse_string(const char *s, int len)
         if (n < 1)
             tcc_error("empty character constant");
         if (n > 1)
-            tcc_warning("multi-character character constant");
+            tcc_warning_c(warn_all)("multi-character character constant");
         for (c = i = 0; i < n; ++i) {
             if (is_long)
                 c = ((nwchar_t *)tokcstr.data)[i];
@@ -2465,7 +2477,7 @@ static void parse_number(const char *p)
                 tokc.f = (float)d;
             } else if (t == 'L') {
                 ch = *p++;
-#ifdef TCC_TARGET_PE
+#ifdef TCC_USING_DOUBLE_FOR_LDOUBLE
                 tok = TOK_CDOUBLE;
                 tokc.d = d;
 #else
@@ -2521,7 +2533,7 @@ static void parse_number(const char *p)
                 tokc.f = strtof(token_buf, NULL);
             } else if (t == 'L') {
                 ch = *p++;
-#ifdef TCC_TARGET_PE
+#ifdef TCC_USING_DOUBLE_FOR_LDOUBLE
                 tok = TOK_CDOUBLE;
                 tokc.d = strtod(token_buf, NULL);
 #else

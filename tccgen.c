@@ -97,7 +97,7 @@ static CString initstr;
 #define VT_PTRDIFF_T (VT_LONG | VT_LLONG)
 #endif
 
-ST_DATA struct switch_t {
+static struct switch_t {
     struct case_t {
         int64_t v1, v2;
 	int sym;
@@ -111,12 +111,12 @@ ST_DATA struct switch_t {
 
 #define MAX_TEMP_LOCAL_VARIABLE_NUMBER 8
 /*list of temporary local variables on the stack in current function. */
-ST_DATA struct temp_local_variable {
+static struct temp_local_variable {
 	int location; //offset on stack. Svalue.c.i
 	short size;
 	short align;
 } arr_temp_local_vars[MAX_TEMP_LOCAL_VARIABLE_NUMBER];
-short nb_temp_local_vars;
+static int nb_temp_local_vars;
 
 static struct scope {
     struct scope *prev;
@@ -131,6 +131,11 @@ typedef struct {
     int local_offset;
     Sym *flex_array_ref;
 } init_params;
+
+#if 1
+#define precedence_parser
+static void init_prec(void);
+#endif
 
 /********************************************************/
 /* stab debug support */
@@ -215,23 +220,6 @@ static struct {
 } tcov_data;
 
 /********************************************************/
-#if 1
-#define precedence_parser
-static void init_prec(void);
-#endif
-/********************************************************/
-#ifndef CONFIG_TCC_ASM
-ST_FUNC void asm_instr(void)
-{
-    tcc_error("inline asm() not supported");
-}
-ST_FUNC void asm_global_instr(void)
-{
-    tcc_error("inline asm() not supported");
-}
-#endif
-
-/* ------------------------------------------------------------------------- */
 static void gen_cast(CType *type);
 static void gen_cast_s(int t);
 static inline CType *pointed_type(CType *type);
@@ -4077,7 +4065,7 @@ static void verify_assign_cast(CType *dt)
             }
         }
         if (qualwarn)
-            tcc_warning("assignment discards qualifiers from pointer target type");
+            tcc_warning_c(warn_discarded_qualifiers)("assignment discards qualifiers from pointer target type");
         break;
     case VT_BYTE:
     case VT_SHORT:
@@ -4355,9 +4343,9 @@ redo:
 	    skip('(');
 	    s = sym_find(tok);
 	    if (!s) {
-	      tcc_warning("implicit declaration of function '%s'",
-			  get_tok_str(tok, &tokc));
-	      s = external_global_sym(tok, &func_old_type);
+	        tcc_warning_c(warn_implicit_function_declaration)(
+                    "implicit declaration of function '%s'", get_tok_str(tok, &tokc));
+	        s = external_global_sym(tok, &func_old_type);
             } else if ((s->type.t & VT_BTYPE) != VT_FUNC)
                 tcc_error("'%s' is not declared as function", get_tok_str(tok, &tokc));
 	    ad->cleanup_func = s;
@@ -4506,8 +4494,7 @@ redo:
             ad->a.dllimport = 1;
             break;
         default:
-            if (tcc_state->warn_unsupported)
-                tcc_warning("'%s' attribute ignored", get_tok_str(t, NULL));
+            tcc_warning_c(warn_unsupported)("'%s' attribute ignored", get_tok_str(t, NULL));
             /* skip parameters */
             if (tok == '(') {
                 int parenthesis = 0;
@@ -5909,23 +5896,20 @@ ST_FUNC void unary(void)
     case TOK___FUNC__:
         {
             Section *sec;
-            void *ptr;
             int len;
             /* special function name identifier */
             len = strlen(funcname) + 1;
             /* generate char[len] type */
-            type.t = VT_BYTE;
-            if (tcc_state->warn_write_strings)
+            type.t = char_type.t;
+            if (tcc_state->warn_write_strings & WARN_ON)
                 type.t |= VT_CONSTANT;
             mk_pointer(&type);
             type.t |= VT_ARRAY;
             type.ref->c = len;
             sec = rodata_section;
             vpush_ref(&type, sec, sec->data_offset, len);
-            if (!NODATA_WANTED) {
-                ptr = section_ptr_add(sec, len);
-                memcpy(ptr, funcname, len);
-            }
+            if (!NODATA_WANTED)
+                memcpy(section_ptr_add(sec, len), funcname, len);
             next();
         }
         break;
@@ -5938,11 +5922,9 @@ ST_FUNC void unary(void)
         goto str_init;
     case TOK_STR:
         /* string parsing */
-        t = VT_BYTE;
-        if (tcc_state->char_is_unsigned)
-            t = VT_BYTE | VT_UNSIGNED;
+        t = char_type.t;
     str_init:
-        if (tcc_state->warn_write_strings)
+        if (tcc_state->warn_write_strings & WARN_ON)
             t |= VT_CONSTANT;
         type.t = t;
         mk_pointer(&type);
@@ -6378,14 +6360,8 @@ special_math_val:
                 tcc_error("'%s' undeclared", name);
             /* for simple function calls, we tolerate undeclared
                external reference to int() function */
-            if (tcc_state->warn_implicit_function_declaration
-#ifdef TCC_TARGET_PE
-                /* people must be warned about using undeclared WINAPI functions
-                   (which usually start with uppercase letter) */
-                || (name[0] >= 'A' && name[0] <= 'Z')
-#endif
-            )
-                tcc_warning("implicit declaration of function '%s'", name);
+            tcc_warning_c(warn_implicit_function_declaration)(
+                "implicit declaration of function '%s'", name);
             s = external_global_sym(t, &func_old_type);
         }
 
@@ -7259,7 +7235,7 @@ static void vla_leave(struct scope *o)
 /* ------------------------------------------------------------------------- */
 /* local scopes */
 
-void new_scope(struct scope *o)
+static void new_scope(struct scope *o)
 {
     /* copy and link previous scope */
     *o = *cur_scope;
@@ -7276,7 +7252,7 @@ void new_scope(struct scope *o)
         tcc_debug_stabn(tcc_state, N_LBRAC, ind - func_ind);
 }
 
-void prev_scope(struct scope *o, int is_expr)
+static void prev_scope(struct scope *o, int is_expr)
 {
     vla_leave(o->prev);
 
@@ -7304,7 +7280,7 @@ void prev_scope(struct scope *o, int is_expr)
 }
 
 /* leave a scope via break/continue(/goto) */
-void leave_scope(struct scope *o)
+static void leave_scope(struct scope *o)
 {
     if (!o)
         return;
@@ -7650,12 +7626,10 @@ again:
 
     block_after_label:
             vla_restore(cur_scope->vla.loc);
-            /* we accept this, but it is a mistake */
-            if (tok == '}') {
-                tcc_warning("deprecated use of label at end of compound statement");
-            } else {
+            if (tok != '}')
                 goto again;
-            }
+            /* we accept this, but it is a mistake */
+            tcc_warning_c(warn_all)("deprecated use of label at end of compound statement");
 
         } else {
             /* expression case */
@@ -8093,11 +8067,6 @@ static void init_putv(init_params *p, CType *type, unsigned long c)
                 else if (sizeof(double) == LDOUBLE_SIZE)
                     memcpy(ptr, &vtop->c.ld, LDOUBLE_SIZE);
 #ifndef TCC_CROSS_TEST
-#if defined(TCC_TARGET_MACHO) && defined(TCC_TARGET_X86_64)
-                /* Special case for Rosetta to handle --cpu=x86_64 on macOS */
-                else if (sizeof(double) == sizeof(long double))
-                    memcpy(ptr, &vtop->c.ld, sizeof(double));
-#endif
                 else
                     tcc_error("can't cross compile long double constants");
 #endif
