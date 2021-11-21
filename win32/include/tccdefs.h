@@ -122,6 +122,12 @@
     /* Linux */
 
 #endif
+    /* Some derived integer types needed to get stdint.h to compile correctly on some platforms */
+#ifndef __NetBSD__
+    #define __UINTPTR_TYPE__ unsigned __PTRDIFF_TYPE__
+    #define __INTPTR_TYPE__ __PTRDIFF_TYPE__
+#endif
+    #define __INT32_TYPE__ int
 
 #if !defined _WIN32
     /* glibc defines */
@@ -216,6 +222,7 @@
     #else
     # define __RENAME(X) __asm__(X)
     #endif
+
     #ifdef __BOUNDS_CHECKING_ON
     # define __BUILTINBC(ret,name,params) ret __builtin_##name params __RENAME("__bound_"#name);
     # define __BOUND(ret,name,params) ret name params __RENAME("__bound_"#name);
@@ -223,8 +230,13 @@
     # define __BUILTINBC(ret,name,params) ret __builtin_##name params __RENAME(#name);
     # define __BOUND(ret,name,params)
     #endif
+#ifdef _WIN32
+    #define __BOTH __BOUND
+    #define __BUILTIN(ret,name,params)
+#else
     #define __BOTH(ret,name,params) __BUILTINBC(ret,name,params)__BOUND(ret,name,params)
     #define __BUILTIN(ret,name,params) ret __builtin_##name params __RENAME(#name);
+#endif
 
     __BOTH(void*, memcpy, (void *, const void*, __SIZE_TYPE__))
     __BOTH(void*, memmove, (void *, const void*, __SIZE_TYPE__))
