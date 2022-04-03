@@ -572,6 +572,7 @@ typedef struct Sym {
     };
     CType type; /* associated type */
     union {
+        int *vla_array_str; /* vla array code */
         struct Sym *next; /* next related symbol (for fields and anoms) */
         struct Sym *cleanupstate; /* in defined labels */
         int asm_label; /* associated asm label */
@@ -643,6 +644,8 @@ typedef struct DLLReference {
 /* type_decl() types */
 #define TYPE_ABSTRACT  1 /* type without variable */
 #define TYPE_DIRECT    2 /* type with variable */
+#define TYPE_PARAM     4 /* type declares function parameter */
+#define TYPE_NEST      8 /* nested call to post_type */
 
 #define IO_BUF_SIZE 8192
 
