@@ -1565,6 +1565,23 @@ static const TCCOption tcc_options[] = {
     { NULL, 0, 0 },
 };
 
+typedef struct stdvalue {
+    uint32_t cversion;
+    const char * name;
+} stdvalue;
+
+/* accepted values for the -std= option */
+static const stdvalue std_values[] = {
+    { 199901, "c99" },
+    { 201112, "c11" },
+    { 201710, "c17" },
+    { 202000, "c2x" },
+    { 199901, "gnu99" },
+    { 201112, "gnu11" },
+    { 201710, "gnu17" },
+    { 202000, "gnu2x" }
+};
+
 typedef struct FlagDef {
     uint16_t offset;
     uint16_t flags;
@@ -1810,7 +1827,13 @@ reparse:
             break;
 #endif
         case TCC_OPTION_g:
-            s->do_debug = 1;
+            /* Use "-g" as alias for "-g1". Use "-g0" to disable debug */
+            /* Other common used values: "-g0", "-g1", "-g2" and "-g3" */
+            /* no failure with unsupported options */
+            if (isnum(*optarg))
+                s->do_debug = atoi(optarg);
+            else
+                s->do_debug = 1;
             break;
         case TCC_OPTION_c:
             x = TCC_OUTPUT_OBJ;
@@ -1835,8 +1858,21 @@ reparse:
             s->static_link = 1;
             break;
         case TCC_OPTION_std:
-            if (strcmp(optarg, "=c11") == 0)
-                s->cversion = 201112;
+            x = 0;
+            if (*optarg == '=') {
+                do {
+                    if (strcmp(std_values[x].name, &optarg[1]) == 0) {
+                        x = std_values[x].cversion;
+                    }
+                    else
+                        ++x;
+                } while (x < (sizeof(std_values)/sizeof(stdvalue)));
+            }
+            if (x > (sizeof(std_values)/sizeof(stdvalue)))
+                s->cversion = x;
+            else
+                goto unsupported_option;
+
             break;
         case TCC_OPTION_shared:
             x = TCC_OUTPUT_DLL;
@@ -1967,7 +2003,11 @@ reparse:
             s->filetype = x | (s->filetype & ~AFF_TYPE_MASK);
             break;
         case TCC_OPTION_O:
-            s->optimize = atoi(optarg);
+            /* Use "-O" as alias for "-O1". */
+            /* Other common used values: "-O0", "-O1", "-O2", "-O3" and "-Os" */
+            /* no failure with unsupported options */
+            x = *optarg;
+            s->optimize = isnum(x) ? atoi(optarg) : (x) ? x : 1;
             break;
         case TCC_OPTION_print_search_dirs:
             x = OPT_PRINT_DIRS;
